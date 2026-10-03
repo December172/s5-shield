@@ -63,7 +63,24 @@ leaves `nv_pci_shutdown()` executing against a device in `D3cold`, and that bus-
 
 This is the same two-halves method published for this model by Anxo Calvo (see *Credits*), with
 two differences: it arms itself from the kernel's reboot notifier instead of from a shutdown hook,
-and it does not assume the GPU is already asleep — that assumption is what step 0 removes.
+and it does not *assume* the GPU is already asleep.
+
+**What step 0 actually does on this laptop (measured 2026-10-03, 15:13 poweroff):** it runs to its
+full `wait_ms` and the dGPU is still in `D0` when the shield arms. The nvidia driver holds a
+runtime PM reference it does not release on its own; `pm_request_idle()` only *asks* the runtime PM
+core, and a driver's own reference makes that idle evaluation return `-EAGAIN` without suspending.
+The module says so on the console (`still in D0, cannot suspend after this: this poweroff can still
+be warm`) and arms anyway.
+
+That is the benign branch, not a failure — but it does mean the saving here comes from **(a)+(b)**,
+not from step 0: the kernel never resumes the GPU, `nv_pci_shutdown()` never runs, and an *idle*
+`D0` GPU costs almost nothing. The measured 50-minute off window (`≤1 W`, cold chassis) had exactly
+that signature. The expensive case is a GPU that is **busy** at poweroff — a CUDA job, an external
+display, PRIME offload — which the shield would freeze busy for ~19 W the whole night; that is the
+case upstream handles with a 90 s wait plus a GRUB `halt` fallback. Nothing here detects it yet
+before the fact, which is one reason the witness's backward self-check exists. `wait_ms=0` in
+`/etc/modprobe.d/s5-shield.conf` skips the wait entirely if you would rather not pay the 5 s on
+every poweroff.
 
 Safety rails: nothing happens on reboot/halt or while the system runs; `devs=` is mandatory, and
 every address is resolved and class-checked (display / audio / PCI bridge only) both at load time
@@ -131,14 +148,28 @@ terminals (`wall`); `bin/s5-shield-status` reports it under **boot self-check**.
 capped at 256 KB (keeping the tail, which always contains the last shutdown record) so it cannot
 grow forever — the same concern upstream solves with `logrotate`, without the extra packaging.
 
-The kernel prints its own account as the machine goes down, visible even with `quiet loglevel=3`:
+The kernel prints its own account as the machine goes down, visible even with `quiet loglevel=3`.
+This is the real output of a poweroff on this laptop (15:13, 2026-10-03) — every line of it, in the
+order it appears:
 
 ```
+s5-shield: poweroff path, 3 device(s) listed
 s5-shield: 0000:01:00.0 is in D0, not asleep; asking runtime PM to let go and waiting up to 5000 ms for D3cold
-s5-shield: 0000:01:00.0 reached D3cold after 300 ms
-s5-shield: 0000:01:00.0 state=D3cold driver=nvidia
+s5-shield: 0000:01:00.0 is still D0 after 5000 ms, giving up on the wait; if this poweroff stays warm it is because the device was never asleep, not because the kernel woke it (README section 7)
+s5-shield: 0000:01:00.0 state=D0 driver=nvidia
+s5-shield: 0000:01:00.0 still in D0, cannot suspend after this: this poweroff can still be warm (README section 7)
+s5-shield: 0000:01:00.0 .shutdown of 'nvidia' nulled
+s5-shield: 0000:01:00.1 state=D3hot driver=snd_hda_intel
+s5-shield: 0000:01:00.1 .shutdown of 'snd_hda_intel' nulled
+s5-shield: 0000:00:01.1 state=D0 driver=pcieport
+s5-shield: 0000:00:01.1 bridge: .shutdown of 'pcieport' left in place on purpose
+s5-shield: 0000:00:01.1 still in D0, cannot suspend after this: this poweroff can still be warm (README section 7)
 s5-shield: done: runtime PM off on 3, .shutdown nulled on 2, skipped 0
 ```
+
+The three `can still be warm` warnings are the module being accurate rather than reassuring: the
+dGPU and its port were awake when it armed, so all it could do was keep the kernel and the driver
+away from them (see the note under *The fix*).
 
 ## Result (2026-10-03)
 
@@ -147,8 +178,10 @@ unplugged the whole time.
 
 * The witness ran (that is itself a fix — see *History*) and recorded the dGPU **still in `D0`
   after 6 s with no holders**: the nvidia driver does not runtime-suspend it on its own once its
-  clients are gone. Step 0's `pm_request_idle()` is what asks for that suspend, a moment *after*
-  the witness stops watching.
+  clients are gone. The module's own 5 s wait ends the same way — a photo of the 15:13 poweroff
+  shows `still D0 after 5000 ms, giving up on the wait` — so step 0 is *not* what makes these
+  poweroffs cheap. **(a)+(b) are:** the kernel never resumes the GPU and `nv_pci_shutdown()` never
+  runs. An idle `D0` GPU is nearly free; the ~19-20 W case is a *busy* one.
 * Battery at the last moment before poweroff **64.743 Wh (82.8%)**; first sample after boot
   **80%** — 2.2 Wh, of which the three minutes of uptime in between are worth 1.2–2.9 Wh. So the
   50 minutes the machine was actually off cost **at most ~1 Wh (≈1 W)**, against the ≈16.7 Wh the
