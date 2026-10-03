@@ -2,8 +2,8 @@
 # Install or remove the shutdown-time witness (the diagnostic that records which
 # D-state the dGPU was really in on the way into S5).
 #
-#     sudo ~/Tools/s5-shield/witness.sh install
-#     sudo ~/Tools/s5-shield/witness.sh remove
+#     sudo /mnt/Shared/Development/Project/Others/s5-shield/witness.sh install
+#     sudo /mnt/Shared/Development/Project/Others/s5-shield/witness.sh remove
 #
 # The witness does not change any power behaviour. It only reads sysfs late in
 # the shutdown and appends the result to the journal and to
@@ -32,7 +32,7 @@ install)
 	echo "real work on the way into S5. After your next poweroff, read the result with:"
 	echo "    journalctl -b -1 -u s5-shutdown-witness.service -o cat"
 	echo "    cat $LOG"
-	echo "then judge it with:  ~/Tools/s5-shield/bin/s5-verdict"
+	echo "then judge it with:  $SRC_DIR/bin/s5-verdict"
 	echo
 	echo "remove it again with:  sudo $SRC_DIR/witness.sh remove"
 	;;

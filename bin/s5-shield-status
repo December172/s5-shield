@@ -2,6 +2,8 @@
 # s5-shield-status: read-only check of the dGPU rail-off shield. No root needed.
 set -u
 
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+
 GPU=0000:01:00.0
 AUD=0000:01:00.1
 BRG=0000:00:01.1
@@ -89,6 +91,18 @@ else
 	echo "  dkms    : not registered"
 fi
 
+echo "== boot self-check =="
+MARKER=/var/lib/s5-shield/check-failed
+if [ -e "$MARKER" ]; then
+	echo "  FAILED : the witness self-check flagged the last poweroff ($MARKER, $(head -1 "$MARKER" 2>/dev/null))"
+	echo "           read the 'check:' lines in /var/log/s5-shield-witness.log, then s5-verdict"
+elif [ -r /var/log/s5-shield-witness.log ]; then
+	line=$(grep -E '^check: (OK|FAIL)' /var/log/s5-shield-witness.log | tail -1)
+	printf '  last   : %s\n' "${line:-no check recorded yet}"
+else
+	echo "  (no witness log: the witness is not installed / has not run yet)"
+fi
+
 echo "== verdict =="
 if lsmod | grep -qw s5_shield; then
 	echo "  Shield is loaded. It will act on the next poweroff only (a reboot is untouched)."
@@ -96,8 +110,8 @@ if lsmod | grep -qw s5_shield; then
 	echo "    s5-shield: <bdf> reached D3cold after <n> ms"
 	echo "    s5-shield: <bdf> state=D3cold driver=nvidia"
 	echo "    s5-shield: done: runtime PM off on 3, .shutdown nulled on 2, skipped 0"
-	echo "  Judge it on the OFF window only: ~/Tools/s5-shield/bin/s5-battery before,"
-	echo "  poweroff, wait 30-60 min, power on, then ~/Tools/s5-shield/bin/s5-verdict."
+	echo "  Judge it on the OFF window only: $HERE/bin/s5-battery before,"
+	echo "  poweroff, wait 30-60 min, power on, then $HERE/bin/s5-verdict."
 else
 	echo "  Shield is NOT loaded: a poweroff behaves as before (chassis stays warm)."
 fi

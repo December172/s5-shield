@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # s5-shield uninstaller. Run it with sudo:
 #
-#     sudo ~/Tools/s5-shield/uninstall.sh
+#     sudo /mnt/Shared/Development/Project/Others/s5-shield/uninstall.sh
 #
 # Removes everything the installer put on the machine: the loaded module, every
 # DKMS registration and its built module, the two config files, the source trees

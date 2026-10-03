@@ -5,8 +5,17 @@ set -u
 
 bat=""
 for d in /sys/class/power_supply/BAT*; do
-	[ -r "$d/energy_now" ] && { bat="$d"; break; }
+	[ -r "$d/energy_now" ] && { bat="$d"; src=energy; break; }
 done
+# Some batteries expose charge (uAh) and voltage (uV) instead of energy (uWh);
+# Wh = charge * voltage / 1e12, the same arithmetic upstream's s5-energy-log
+# uses. Without this the tool would report "no battery" on a machine whose
+# witness record is perfectly happy.
+if [ -z "$bat" ]; then
+	for d in /sys/class/power_supply/BAT*; do
+		[ -r "$d/charge_now" ] && [ -r "$d/voltage_now" ] && { bat="$d"; src=charge; break; }
+	done
+fi
 ac=""
 for d in /sys/class/power_supply/A*; do
 	[ -r "$d/online" ] && { ac="$d"; break; }
@@ -17,8 +26,13 @@ if [ -z "$bat" ]; then
 	exit 1
 fi
 
-now=$(cat "$bat/energy_now")
-full=$(cat "$bat/energy_full")
+if [ "$src" = energy ]; then
+	now=$(cat "$bat/energy_now")
+	full=$(cat "$bat/energy_full")
+else
+	now=$(( $(cat "$bat/charge_now") * $(cat "$bat/voltage_now") / 1000000 ))
+	full=$(( $(cat "$bat/charge_full") * $(cat "$bat/voltage_now") / 1000000 ))
+fi
 online="unknown"
 [ -n "$ac" ] && online=$(cat "$ac/online")
 

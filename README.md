@@ -61,6 +61,10 @@ cannot sleep while a child below it is awake — which is what has to happen for
 resource (`PG00` / `LNXPOWER:04`) to release the rail. Steps 1 and 2 must go together: 1 alone
 leaves `nv_pci_shutdown()` executing against a device in `D3cold`, and that bus-locks this machine.
 
+This is the same two-halves method published for this model by Anxo Calvo (see *Credits*), with
+two differences: it arms itself from the kernel's reboot notifier instead of from a shutdown hook,
+and it does not assume the GPU is already asleep — that assumption is what step 0 removes.
+
 Safety rails: nothing happens on reboot/halt or while the system runs; `devs=` is mandatory, and
 every address is resolved and class-checked (display / audio / PCI bridge only) both at load time
 and again at poweroff; `amdgpu`, `nvme`, `ahci`, `xhci_hcd`, networking and the rest are refused
@@ -71,8 +75,8 @@ load and you simply get today's behaviour.
 ## Install / uninstall (root)
 
 ```bash
-sudo ~/Tools/s5-shield/install.sh     # checks, DKMS build, configs, live reload, /boot fingerprint
-sudo ~/Tools/s5-shield/uninstall.sh   # back to the previous behaviour, nothing left behind
+sudo /mnt/Shared/Development/Project/Others/s5-shield/install.sh     # checks, DKMS build, configs, live reload, /boot fingerprint
+sudo /mnt/Shared/Development/Project/Others/s5-shield/uninstall.sh   # back to the previous behaviour, nothing left behind
 ```
 
 `install.sh` runs the two self-checks in `bin/` first and **refuses to install** if the module
@@ -82,8 +86,8 @@ would not accept this machine's devices. DKMS then rebuilds it on every kernel u
 ## Verify and measure
 
 ```bash
-~/Tools/s5-shield/bin/s5-shield-status    # loaded? installed source == this revision? device states
-~/Tools/s5-shield/bin/s5-shield-dryrun    # what the module would do, read out of the C source
+/mnt/Shared/Development/Project/Others/s5-shield/bin/s5-shield-status    # loaded? installed source == this revision? device states
+/mnt/Shared/Development/Project/Others/s5-shield/bin/s5-shield-dryrun    # what the module would do, read out of the C source
 dmesg | grep s5-shield                    # "ready: 3 target(s), noshut=…, wait_ms=5000"
 ```
 
@@ -93,17 +97,39 @@ nothing else:
 
 ```bash
 # 1. charge it, then UNPLUG the charger (AC masks everything)
-~/Tools/s5-shield/bin/s5-battery
+/mnt/Shared/Development/Project/Others/s5-shield/bin/s5-battery
 # 2. sudo systemctl poweroff        (a real poweroff, not a reboot)
 # 3. wait 30-60 min, power on, then:
-~/Tools/s5-shield/bin/s5-verdict          # watts across the OFF window
+/mnt/Shared/Development/Project/Others/s5-shield/bin/s5-verdict          # watts across the OFF window
 cat /var/log/s5-shield-witness.log        # what state the dGPU was in, and when
 ```
 
-The optional **shutdown witness** (`sudo ~/Tools/s5-shield/witness.sh install`, refreshed
+The optional **shutdown witness** (`sudo /mnt/Shared/Development/Project/Others/s5-shield/witness.sh install`, refreshed
 automatically by `install.sh`) records the dGPU, its root port and the port's ACPI state with
 timestamps on the way into S5, plus the battery at both ends of the off window. It only reads
 sysfs — no `lspci`, no `nvidia-smi`, nothing that could wake the device being measured.
+
+### The silent-failure alarm
+
+The failure mode of this whole fix is silence: the shutdown looks perfect whether or not the
+shield did anything. So the witness also runs a **two-way self-check on every boot** (idea taken
+from upstream's `s5-mitigacion-check`) and writes it into the same record:
+
+```
+check: OK - FORWARD: shield loaded, accepted its device list, armed for the next poweroff
+check: OK - BACKWARD: last poweroff drew 0.31 W over 1.20 h (the boot itself is inside that)
+```
+
+* **forward** — is `s5_shield` loaded and did it report `ready` in this boot's kernel log? If not,
+  the *next* poweroff will burn ~20 W again.
+* **backward** — was the *last* one shielded? That is the off-window arithmetic above, judged only
+  when it means something: early in the boot, charger unplugged at both ends, window ≥ 15 min.
+  Anything else says `not judged` and why, instead of inventing a number.
+
+If either fails, the check also writes `/var/lib/s5-shield/check-failed` and shouts on the
+terminals (`wall`); `bin/s5-shield-status` reports it under **boot self-check**. The witness log is
+capped at 256 KB (keeping the tail, which always contains the last shutdown record) so it cannot
+grow forever — the same concern upstream solves with `logrotate`, without the extra packaging.
 
 The kernel prints its own account as the machine goes down, visible even with `quiet loglevel=3`:
 
@@ -164,9 +190,9 @@ of mirroring them. The witness unit had a third such bug: with `DefaultDependenc
 | `install.sh`, `uninstall.sh` | the only two things you have to run |
 | `witness.sh` | installs/removes the optional shutdown witness |
 | `systemd/s5-shutdown-witness.service` | the witness unit (boot record + shutdown record) |
-| `bin/s5-shutdown-witness` | the witness itself: reads sysfs only, never touches a driver |
+| `bin/s5-shutdown-witness` | the witness itself: boot self-check + shutdown timeline, reads sysfs only |
 | `bin/s5-verdict` | pairs the shutdown and boot records, prints the watts across the off window |
-| `bin/s5-shield-status` | module loaded? installed source this revision? where is each device |
+| `bin/s5-shield-status` | module loaded? installed source this revision? self-check result, device states |
 | `bin/s5-battery` | one-line battery/AC snapshot for a before/after measurement |
 | `bin/s5-shield-dryrun`, `bin/s5-logictest` | the two self-checks `install.sh` refuses to skip |
 
@@ -176,9 +202,11 @@ Nothing outside `/usr/src/s5-shield-1.3`, `/etc/modprobe.d`, `/etc/modules-load.
 
 ## Credits
 
-* Diagnosis and method for this exact model: **Anxo Calvo**,
-  [s5-poweroff-fix](https://github.com/AnxoCalvo/s5-poweroff-fix); upstream analysis and the
-  never-merged fix: **Mario Limonciello** and the LKML thread linked above.
+* Diagnosis, the two-halves method and the evidence base for this exact model: **Anxo Calvo**,
+  [s5-poweroff-fix](https://github.com/AnxoCalvo/s5-poweroff-fix) — also the source of the
+  `pcieport` exception, the `nvidia`/`snd_hda_intel` whitelist, the kexec explanation, the
+  boot self-check idea, the charge-based battery fallback and the log-rotation rationale;
+  upstream analysis and the never-merged fix: **Mario Limonciello** and the LKML thread above.
 * The module, the tooling and this document were written by the **deepseek-flash** coding agent
   (DeepSeek Harness) in session with december172, 2026-10-03 — including finding two bugs in its
   own earlier revisions, the third in the witness unit, and the instrumented test that settled

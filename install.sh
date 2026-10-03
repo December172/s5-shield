@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # s5-shield installer. Run it with sudo:
 #
-#     sudo ~/Tools/s5-shield/install.sh
+#     sudo /mnt/Shared/Development/Project/Others/s5-shield/install.sh
 #
 # It does exactly seven things, and nothing else:
 #   1. copies the module source to /usr/src/s5-shield-1.3
@@ -131,11 +131,11 @@ fi
 
 echo
 echo "=== done ==="
-echo "Verify any time with:  ~/Tools/s5-shield/bin/s5-shield-status"
+echo "Verify any time with:  $SRC_DIR/bin/s5-shield-status"
 echo
 echo "Then measure it properly (a reboot proves nothing - the shield acts on poweroff only):"
-echo "    1. unplug the charger            ~/Tools/s5-shield/bin/s5-battery"
+echo "    1. unplug the charger            $SRC_DIR/bin/s5-battery"
 echo "    2. sudo systemctl poweroff       (watch the last console lines)"
 echo "    3. wait 30-60 min, power on, do not boot in between"
-echo "    4. ~/Tools/s5-shield/bin/s5-verdict"
+echo "    4. $SRC_DIR/bin/s5-verdict"
 echo "Remove everything again with:  sudo $SRC_DIR/uninstall.sh"

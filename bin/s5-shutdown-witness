@@ -40,7 +40,11 @@ set -u
 #                                  s5-verdict read 5 W for a clean S5).
 MODE=${1:-shutdown}
 
-LOG=/var/log/s5-shield-witness.log
+# Overridable for testing (the unit always uses the real paths).
+LOG=${S5_WITNESS_LOG:-/var/log/s5-shield-witness.log}
+MARKER=${S5_WITNESS_MARKER:-/var/lib/s5-shield/check-failed}
+UMBRAL_W=${S5_WITNESS_UMBRAL_W:-4}	# off-window watts above which the check shouts
+LOG_MAX=${S5_WITNESS_LOG_MAX:-262144}	# trim the log above this size, keep the tail
 WAIT=${S5_WITNESS_WAIT:-6}	# seconds to watch the dGPU settle
 STEP_MS=250
 GPU=0000:01:00.0
@@ -51,15 +55,53 @@ state_of() { cat "/sys/bus/pci/devices/$1/power_state" 2>/dev/null || echo "?"; 
 acpi_of() { cat "/sys/bus/pci/devices/$1/firmware_node/real_power_state" 2>/dev/null || echo "?"; }
 rpm_of() { cat "/sys/bus/pci/devices/$1/power/runtime_status" 2>/dev/null || echo "?"; }
 
-# battery in Wh; both modes print it in the same format so s5-verdict can pair
-# the shutdown record with the following boot record.
-battery_line() {
+# Battery in Wh. energy_now is the normal source; some batteries only expose
+# charge_now (uAh) and voltage_now (uV), where Wh = charge * voltage / 1e12
+# (the same arithmetic upstream's s5-energy-log uses - this machine exposes
+# energy, so that branch is the untested-on-here fallback). Without it the whole
+# evidence chain (battery: line -> s5-verdict -> off-window watts) would be empty
+# on such a machine. The FIRST readable battery wins, so a two-battery laptop
+# cannot mix cells between the two ends of a window.
+battery_wh() {
 	local b
 	for b in /sys/class/power_supply/BAT*; do
 		[ -r "$b/energy_now" ] || continue
-		awk -v n="$(cat "$b/energy_now")" -v f="$(cat "$b/energy_full")" \
-			'BEGIN { printf "battery: %.3f Wh (%.1f%%)\n", n/1e6, (f>0?100*n/f:0) }'
+		awk -v n="$(cat "$b/energy_now")" 'BEGIN { printf "%.3f", n/1e6 }'
+		return 0
 	done
+	for b in /sys/class/power_supply/BAT*; do
+		[ -r "$b/charge_now" ] && [ -r "$b/voltage_now" ] || continue
+		awk -v c="$(cat "$b/charge_now")" -v v="$(cat "$b/voltage_now")" \
+			'BEGIN { printf "%.3f", c*v/1e12 }'
+		return 0
+	done
+	return 1
+}
+
+battery_full_wh() {
+	local b
+	for b in /sys/class/power_supply/BAT*; do
+		[ -r "$b/energy_full" ] || continue
+		awk -v n="$(cat "$b/energy_full")" 'BEGIN { printf "%.3f", n/1e6 }'
+		return 0
+	done
+	for b in /sys/class/power_supply/BAT*; do
+		[ -r "$b/charge_full" ] && [ -r "$b/voltage_now" ] || continue
+		awk -v c="$(cat "$b/charge_full")" -v v="$(cat "$b/voltage_now")" \
+			'BEGIN { printf "%.3f", c*v/1e12 }'
+		return 0
+	done
+	return 1
+}
+
+# Both modes print the battery in the same format, so s5-verdict can pair the
+# shutdown record with the boot record that follows it.
+battery_line() {
+	local wh full
+	wh=$(battery_wh) || return 0
+	full=$(battery_full_wh) || full=""
+	awk -v n="$wh" -v f="${full:-0}" \
+		'BEGIN { printf "battery: %.3f Wh (%.1f%%)\n", n, (f>0 ? 100*n/f : 0) }'
 }
 
 ac_line() {
@@ -82,7 +124,106 @@ holders() {
 	printf '%s' "${out:- none}"
 }
 
+# ---------------------------------------------------------------- self-check
+# Two-way check on every boot (same idea as upstream's s5-mitigacion-check):
+#
+#   forward  - will the NEXT poweroff be shielded? The module is loaded early in
+#              boot by /etc/modules-load.d and reports "ready" in the kernel log;
+#              if either is missing, the next poweroff burns ~20 W again.
+#   backward - was the LAST one? The witness wrote the battery microseconds
+#              before poweroff, so pairing it with the battery now (seconds
+#              after boot) gives the watts across the off window.
+#
+# The failure mode of this whole fix is silence - the shutdown looks perfect
+# either way - so a failure here also leaves MARKER behind and shouts on the
+# terminals. Setting CHECK_BAD (rather than returning) keeps the verdict visible
+# even though the report itself is built in a subshell.
+CHECK_OUT=""
+CHECK_BAD=0
+chk_note() { CHECK_OUT="${CHECK_OUT}check: $1
+"; }
+chk_ok() { chk_note "OK - $1"; }
+chk_bad() { CHECK_BAD=1; chk_note "FAIL - $1"; }
+
+check_forward() {
+	if ! lsmod | grep -qw s5_shield; then
+		chk_bad "FORWARD: s5_shield is NOT loaded in this boot, so the next poweroff will not be shielded"
+		return
+	fi
+	if [ "$(journalctl -b 0 -k --no-pager 2>/dev/null | grep -c 's5-shield: ready:')" -lt 1 ]; then
+		chk_bad "FORWARD: s5_shield is loaded but this boot has no 'ready' line - it refused its device list (dmesg)"
+		return
+	fi
+	chk_ok "FORWARD: shield loaded, accepted its device list, armed for the next poweroff"
+}
+
+check_backward() {
+	local t_off e_off ac_off wh now_s off_s line up_s ac_now a
+	[ -r "$LOG" ] || { chk_note "backward: no witness log yet, nothing to judge"; return; }
+	# Only meaningful in the first minutes of a boot: run by hand hours later,
+	# the "off window" would contain all that uptime and the number would be
+	# meaningless. (That is the trap this whole project exists to avoid.)
+	up_s=${S5_WITNESS_UP_S:-$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null || echo 0)}
+	if [ "${up_s:-0}" -gt 600 ]; then
+		chk_note "backward: not judged - this boot is already ${up_s}s old, the check is only meaningful at boot"
+		return
+	fi
+	ac_now=${S5_WITNESS_AC:-}
+	if [ -z "$ac_now" ]; then
+		for a in /sys/class/power_supply/A*; do
+			[ -r "$a/online" ] || continue
+			ac_now=$(cat "$a/online" 2>/dev/null)
+			break
+		done
+	fi
+	[ "${ac_now:-0}" = "1" ] && { chk_note "backward: not judged - the charger is connected now, it skews the window"; return; }
+	read -r t_off e_off ac_off <<<"$(awk '
+		/^=== [0-9T:+-]+ shutdown witness ===/ { on = 1; t = $2; e = ""; a = ""; next }
+		/^=== / { on = 0 }
+		on && /^battery: /   { e = $2 }
+		on && /^ac_online: / { a = $2 }
+		END { printf "%s %s %s", t, e, a }
+	' "$LOG")"
+	[ -n "${t_off:-}" ] || { chk_note "backward: no shutdown record in the log, cannot judge"; return; }
+	[ -n "${e_off:-}" ] || { chk_note "backward: the shutdown record has no battery line, cannot judge"; return; }
+	[ "${ac_off:-x}" = "1" ] && { chk_note "backward: the charger was connected at that poweroff, not measurable"; return; }
+	wh=$(battery_wh) || { chk_note "backward: no readable battery now, cannot judge"; return; }
+	now_s=$(date +%s)
+	off_s=$(date -d "$t_off" +%s 2>/dev/null) || off_s=""
+	[ -n "$off_s" ] || { chk_note "backward: unparsable timestamp '$t_off'"; return; }
+	line=$(awk -v e0="$e_off" -v e1="$wh" -v t0="$off_s" -v t1="$now_s" -v u="$UMBRAL_W" '
+		BEGIN {
+			h = (t1 - t0) / 3600.0; d = e0 - e1;
+			if (h < 0.25) {
+				printf "backward: last poweroff ended %.0f min ago, too short to judge (a reboot?)\n", h*60;
+				exit 0
+			}
+			w = d / h;
+			if (w > u)
+				printf "FAIL - BACKWARD: the last poweroff drew %.2f W over %.2f h: the rail was NOT cut\n", w, h;
+			else
+				printf "OK - BACKWARD: last poweroff drew %.2f W over %.2f h (the boot itself is inside that)\n", w, h;
+		}')
+	case "$line" in
+	FAIL*)	chk_bad "${line#FAIL - }" ;;
+	*)	chk_note "$line" ;;
+	esac
+}
+
 if [ "$MODE" = "boot" ]; then
+	# The log is capped here rather than rotated by logrotate: no extra
+	# packaging, and the tail we keep (64 KB) always contains the shutdown
+	# record of a few hundred bytes that the check above is about to read.
+	if [ -r "$LOG" ]; then
+		sz=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
+		if [ "$sz" -gt "$LOG_MAX" ]; then
+			tail -c $((LOG_MAX / 4)) "$LOG" >"$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG" 2>/dev/null
+		fi
+	fi
+	CHECK_OUT=""
+	CHECK_BAD=0
+	check_forward
+	check_backward
 	report=$(
 		{
 			echo "=== $(date -Is) boot witness ==="
@@ -92,6 +233,7 @@ if [ "$MODE" = "boot" ]; then
 			else
 				echo "s5_shield: not loaded yet (it may load later in this boot)"
 			fi
+			printf '%s' "$CHECK_OUT"
 			for d in "$GPU" "$AUD" "$PORT"; do
 				echo "$d: state=$(state_of "$d") rpm=$(rpm_of "$d")"
 			done
@@ -176,4 +318,17 @@ printf '%s\n' "$report"
 # the journal copy above is the primary record).
 if { : >>"$LOG"; } 2>/dev/null; then
 	printf '%s\n' "$report" >>"$LOG"
+fi
+
+# A silent failure is the one failure this fix cannot afford, so a failed check
+# leaves a marker (readable from s5-shield-status) and shouts on the terminals.
+# Only when running as root - the unit does, a hand-run for testing does not.
+if [ "$MODE" = "boot" ] && [ "$(id -u)" = 0 ]; then
+	if [ "$CHECK_BAD" = 1 ]; then
+		mkdir -p "$(dirname "$MARKER")" 2>/dev/null || true
+		date -Is >"$MARKER" 2>/dev/null || true
+		wall "s5-shield: self-check FAILED - the dGPU rail-off shield did not work as expected. See $LOG." 2>/dev/null || true
+	else
+		rm -f "$MARKER" 2>/dev/null || true
+	fi
 fi
