@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# s5-shutdown-witness: record what the dGPU's power state actually was on the way
+# into S5. Run automatically by s5-shutdown-witness.service's ExecStop, i.e.
+# while the shutdown is in progress but journald and / are still alive, so the
+# record lands in the journal (read it after the next boot with
+# `journalctl -b -1 -u s5-shutdown-witness.service -o cat`) and in
+# /var/log/s5-shield-witness.log.
+#
+# It only READS sysfs. Deliberately no lspci, no nvidia-smi, no /proc/asound:
+# those reach the driver and can wake the device, which would corrupt exactly the
+# measurement this exists to take. Reading power_state/runtime_status is safe for
+# the same reason - v7.2.8 drivers/pci/pci-sysfs.c power_state_show() only prints
+# the cached pdev->current_state, it does not touch config space.
+#
+# Two things it adds over revision 1, both of which were missing when the first
+# S5 test produced no record at all:
+#
+#   * a timeline. The dGPU can only reach D3cold once the compositor has closed
+#     /dev/nvidia0, which happens somewhere in the shutdown transaction - so the
+#     state at any single instant says nothing. Sampling until the state stops
+#     changing, and recording *when* it changed, is what makes the record
+#     readable.
+#   * the holders. A "still D0" verdict is useless without knowing whether
+#     something still had the device open.
+#
+# Why the ACPI lines matter: on this machine the GPU's rail is released through
+# the ACPI power resource declared for its root port (\_SB.PCI0.GPP0 declares
+# PG00 = LNXPOWER:04 as its D3 resource). If the port is in ACPI D0 at shutdown,
+# the rail is still on, whatever the PCI-level state says.
+set -u
+
+# Two modes, one script:
+#   s5-shutdown-witness          (no argument) - the ExecStop record, as above
+#   s5-shutdown-witness boot     - the ExecStart record: battery and device
+#                                  states a few seconds after boot, so the next
+#                                  poweroff's drain can be computed across the
+#                                  OFF window alone instead of across all the
+#                                  uptime in between (the mistake that made the
+#                                  first "test" unreadable, and that made
+#                                  s5-verdict read 5 W for a clean S5).
+MODE=${1:-shutdown}
+
+LOG=/var/log/s5-shield-witness.log
+WAIT=${S5_WITNESS_WAIT:-6}	# seconds to watch the dGPU settle
+STEP_MS=250
+GPU=0000:01:00.0
+AUD=0000:01:00.1
+PORT=0000:00:01.1
+
+state_of() { cat "/sys/bus/pci/devices/$1/power_state" 2>/dev/null || echo "?"; }
+acpi_of() { cat "/sys/bus/pci/devices/$1/firmware_node/real_power_state" 2>/dev/null || echo "?"; }
+rpm_of() { cat "/sys/bus/pci/devices/$1/power/runtime_status" 2>/dev/null || echo "?"; }
+
+# battery in Wh; both modes print it in the same format so s5-verdict can pair
+# the shutdown record with the following boot record.
+battery_line() {
+	local b
+	for b in /sys/class/power_supply/BAT*; do
+		[ -r "$b/energy_now" ] || continue
+		awk -v n="$(cat "$b/energy_now")" -v f="$(cat "$b/energy_full")" \
+			'BEGIN { printf "battery: %.3f Wh (%.1f%%)\n", n/1e6, (f>0?100*n/f:0) }'
+	done
+}
+
+ac_line() {
+	local a
+	for a in /sys/class/power_supply/A*; do
+		[ -r "$a/online" ] || continue
+		echo "ac_online: $(cat "$a/online")"
+	done
+}
+
+# Processes still holding the dGPU open. readlink() only - opening the device
+# node would itself take a runtime PM reference and wake the thing we measure.
+# find(1) does the readlinking in C: a shell loop over /proc/*/fd/* takes
+# seconds here, and this runs inside a shutdown timeout.
+holders() {
+	local out
+	out=$(find /proc/[0-9]*/fd \( -lname '/dev/nvidia*' -o -lname '/dev/dri/card0' \) \
+		-printf '%p %l\n' 2>/dev/null |
+		awk '{ n = split($1, a, "/"); print a[3] ":" $2 }' | sort -u | tr '\n' ' ')
+	printf '%s' "${out:- none}"
+}
+
+if [ "$MODE" = "boot" ]; then
+	report=$(
+		{
+			echo "=== $(date -Is) boot witness ==="
+			echo "kernel: $(uname -r)"
+			if lsmod | grep -qw s5_shield; then
+				echo "s5_shield: loaded, srcversion=$(cat /sys/module/s5_shield/srcversion 2>/dev/null) wait_ms=$(cat /sys/module/s5_shield/parameters/wait_ms 2>/dev/null)"
+			else
+				echo "s5_shield: not loaded yet (it may load later in this boot)"
+			fi
+			for d in "$GPU" "$AUD" "$PORT"; do
+				echo "$d: state=$(state_of "$d") rpm=$(rpm_of "$d")"
+			done
+			echo "holders:$(holders)"
+			battery_line
+			ac_line
+		} 2>&1
+	)
+else
+	report=$(
+		{
+			echo "=== $(date -Is) shutdown witness ==="
+			echo "kernel: $(uname -r)"
+			if lsmod | grep -qw s5_shield; then
+				echo "s5_shield: loaded, srcversion=$(cat /sys/module/s5_shield/srcversion 2>/dev/null) devs=$(cat /sys/module/s5_shield/parameters/devs 2>/dev/null) wait_ms=$(cat /sys/module/s5_shield/parameters/wait_ms 2>/dev/null)"
+			else
+				echo "s5_shield: NOT loaded -> the poweroff will behave as before"
+			fi
+			echo "holders at entry:$(holders)"
+			echo "state at entry: dGPU=$(state_of "$GPU") port=$(state_of "$PORT") audio=$(state_of "$AUD")"
+
+			# Watch the dGPU settle, which can only happen after the compositor
+			# has let go of it, and record WHEN each state change happened.
+			# Stop early once it is D3cold - the rail-off state - so a healthy
+			# shutdown is not delayed at all.
+			echo "timeline (dGPU / root port / port ACPI state, t = ms after the line above):"
+			elapsed=0
+			prev=""
+			while [ "$elapsed" -lt $((WAIT * 1000)) ]; do
+				g=$(state_of "$GPU")
+				p=$(state_of "$PORT")
+				a=$(acpi_of "$PORT")
+				cur="$g/$p/$a"
+				if [ "$cur" != "$prev" ]; then
+					printf '  +%5d ms  dGPU=%-6s port=%-6s port_acpi=%s\n' \
+						"$elapsed" "$g" "$p" "$a"
+					prev="$cur"
+				fi
+				[ "$g" = "D3cold" ] && break
+				sleep 0.25
+				elapsed=$((elapsed + STEP_MS))
+			done
+			if [ "$(state_of "$GPU")" = "D3cold" ]; then
+				echo "settled: dGPU reached D3cold after ${elapsed} ms (rail off)"
+			else
+				# This is what the 2026-10-03 11:51 record showed, and it is NOT
+				# the end of the story: the nvidia driver does not suspend the
+				# dGPU on its own once its clients are gone - s5_shield nudges it
+				# with pm_request_idle() in the poweroff notifier, a moment after
+				# this record ends. Watch the kernel console lines for what it
+				# reached there; the next boot's record settles the outcome.
+				echo "settled: dGPU still $(state_of "$GPU") after ${elapsed} ms - it does not suspend on its own."
+				echo "         s5_shield nudges it (pm_request_idle) in the poweroff notifier just after this"
+				echo "         record ends; the kernel console lines show whether it reached D3cold there,"
+				echo "         and the battery record in the next boot witness settles it either way."
+			fi
+			echo "holders at exit:$(holders)"
+
+			echo "final:"
+			# These lines are deliberately NOT indented: bin/s5-verdict parses them
+			# with ^0000:01:00.0: state=... and ^0000:00:01.1: acpi power_state=...
+			# to cross-reference its verdict with what was actually seen here.
+			for d in "$GPU" "$AUD" "$PORT"; do
+				echo "$d: state=$(state_of "$d") rpm=$(rpm_of "$d")"
+				if [ -d "/sys/bus/pci/devices/$d/firmware_node" ]; then
+					res=""
+					for r in "/sys/bus/pci/devices/$d"/firmware_node/power_resources_D*; do
+						[ -d "$r" ] || continue
+						res="$res $(basename "$r" | sed 's/power_resources_//')"
+					done
+					echo "$d: acpi power_state=$(cat "/sys/bus/pci/devices/$d/firmware_node/power_state" 2>/dev/null) real_power_state=$(acpi_of "$d") resources:${res:-none}"
+				fi
+			done
+			battery_line
+			ac_line
+		} 2>&1
+	)
+fi
+
+printf '%s\n' "$report"
+# Append to the log only if it is actually writable (skip silently otherwise:
+# the journal copy above is the primary record).
+if { : >>"$LOG"; } 2>/dev/null; then
+	printf '%s\n' "$report" >>"$LOG"
+fi

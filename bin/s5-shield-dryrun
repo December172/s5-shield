@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# s5-shield-dryrun: what would s5_shield decide at poweroff, on THIS machine,
+# without loading anything and without root.
+#
+# It does NOT hardcode what the module accepts. It reads the accept-list out of
+# the C source's class_allowed() switch, resolves those PCI class macros in the
+# kernel headers, and compares them with the live hardware. That is deliberate:
+# an earlier revision accepted PCI_CLASS_MULTIMEDIA_AUDIO (0x0401) while this
+# machine's GPU audio function is 0x0403, so the module would have refused to
+# load - and a mirror with hardcoded values happily reported "fine". A mirror
+# that cannot disagree with the source is worthless.
+set -u
+
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+SRC="$HERE/src/s5_shield.c"
+
+DEVS=${DEVS:-0000:01:00.0,0000:01:00.1,0000:00:01.1}
+NOSHUT=${NOSHUT:-nvidia,snd_hda_intel}
+# must mirror protected_drivers[] in the C source
+PROTECTED="amdgpu i915 xe nouveau nvme ahci sdhci xhci_hcd thunderbolt r8169 mt7921e iwlwifi"
+# must mirror never_null[] in the C source
+NEVER_NULL="pcieport"
+
+[ -f "$SRC" ] || { echo "cannot find $SRC" >&2; exit 1; }
+
+# --- resolve the accept-list from source + headers -------------------------
+IDS=""
+for d in /lib/modules/"$(uname -r)"/build /lib/modules/*/build; do
+	[ -f "$d/include/linux/pci_ids.h" ] && { IDS="$d/include/linux/pci_ids.h"; break; }
+done
+[ -n "$IDS" ] || { echo "no kernel headers with pci_ids.h found" >&2; exit 1; }
+
+macros=$(sed -n '/static bool class_allowed/,/^}/p' "$SRC" | grep -oE 'PCI_CLASS_[A-Z0-9_]+' | sort -u)
+[ -n "$macros" ] || { echo "cannot read class_allowed() cases from $SRC" >&2; exit 1; }
+
+# The shift the C code applies to pdev->class. That field is the full 24-bit code
+# (include/linux/pci.h: "unsigned int class; /* 3 bytes: (base,sub,prog-if) */")
+# while the PCI_CLASS_* macros are 16-bit, so it must be 8 - the kernel's own
+# idiom is (pdev->class >> 8) == PCI_CLASS_DISPLAY_VGA. Taking it from the source
+# rather than assuming it is what catches the revision 1.1 bug, where the C code
+# shifted by 16 and therefore matched no device at all.
+CLASS_SHIFT=$( { sed -n '/pci_class16/,/^}/p' "$SRC"; sed -n '/static bool class_allowed/,/^}/p' "$SRC"; } | grep -oE 'class >> [0-9]+' | grep -oE '[0-9]+' | head -1)
+[ -n "$CLASS_SHIFT" ] || { echo "cannot find the class shift in $SRC; refusing to guess" >&2; exit 1; }
+echo "class decoding in the C code: pdev->class >> $CLASS_SHIFT   (must be 8 to match the pci_ids.h macros)"
+
+accepted=""
+echo "class accept-list, taken from src/s5_shield.c and resolved in $(basename "$(dirname "$(dirname "$IDS")")")/pci_ids.h:"
+for m in $macros; do
+	v=$(awk -v m="$m" '$1=="#define" && $2==m {print $3}' "$IDS" | head -1)
+	if [ -z "$v" ]; then
+		echo "  REFUSING TO GUESS: $m is not defined in pci_ids.h" >&2
+		exit 1
+	fi
+	printf '  %-34s = %s (%d)\n' "$m" "$v" "$((v))"
+	accepted="$accepted $((v))"
+done
+
+class_ok() { # $1 = full sysfs class, e.g. 0x040300
+	local base=$(( $1 >> CLASS_SHIFT )) a
+	for a in $accepted; do [ "$base" = "$a" ] && return 0; done
+	return 1
+}
+
+is_protected() {
+	local p
+	for p in $PROTECTED; do [ "$1" = "$p" ] && return 0; done
+	return 1
+}
+
+in_list() { # $1 = list, $2 = token (whitespace tolerant, like the C code)
+	case ",$(echo "$1" | tr -d ' \t')," in
+		*",$2,"*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+is_below() { # $1 = child bdf, $2 = candidate ancestor bdf
+	local p
+	p=$(readlink -f "/sys/bus/pci/devices/$1" 2>/dev/null) || return 1
+	while [ -n "$p" ] && [ "$p" != "/" ]; do
+		p=$(dirname "$p")
+		[ "$(basename "$p")" = "$2" ] && return 0
+	done
+	return 1
+}
+
+drv_of() {
+	local d
+	d=$(readlink -f "/sys/bus/pci/devices/$1/driver" 2>/dev/null)
+	[ -n "$d" ] && basename "$d" || true
+}
+
+echo
+echo "what the module would do at poweroff (options: devs=$DEVS noshut=$NOSHUT):"
+refuse=0
+nvidia_display=0
+declare -a ok_bdfs=()
+IFS=',' read -r -a toks <<< "$DEVS"
+for tok in "${toks[@]}"; do
+	[ -z "$tok" ] && continue
+	p="/sys/bus/pci/devices/$tok"
+	if [ ! -d "$p" ]; then
+		printf '  REFUSE  %-14s no such device\n' "$tok"; refuse=1; continue
+	fi
+	cls=$(cat "$p/class" 2>/dev/null)
+	drv=$(drv_of "$tok")
+	state=$(cat "$p/power_state" 2>/dev/null)
+	vendor=$(cat "$p/vendor" 2>/dev/null)
+	base=$(printf '0x%04x' $(( cls >> CLASS_SHIFT )))
+
+	if ! class_ok "$cls"; then
+		printf '  REFUSE  %-14s class %s (%s) not in the accept-list above\n' "$tok" "$cls" "$base"; refuse=1; continue
+	fi
+	if is_protected "$drv"; then
+		printf '  SKIP    %-14s bound to protected driver "%s"\n' "$tok" "$drv"; continue
+	fi
+	case "$base" in
+		0x0300|0x0302|0x0380) [ "$vendor" = "0x10de" ] && nvidia_display=$((nvidia_display + 1)) ;;
+	esac
+
+	if [ -z "$drv" ]; then
+		action="runtime PM disabled (no driver -> nothing to null)"
+	elif in_list "$NOSHUT" "$drv" && ! in_list "$NEVER_NULL" "$drv"; then
+		action="runtime PM disabled + .shutdown nulled"
+	elif [ "$base" = "0x0604" ]; then
+		action="runtime PM disabled only (bridge: .shutdown of $drv left in place on purpose)"
+	else
+		printf '  SKIP    %-14s driver "%s" has a .shutdown callback not covered by noshut= -> runtime PM left alone (that combination is the documented bus-lock)\n' "$tok" "$drv"
+		continue
+	fi
+	printf '  SHIELD  %-14s class=%s driver=%-14s state=%-6s -> %s\n' "$tok" "$cls" "${drv:-(none)}" "${state:-?}" "$action"
+	ok_bdfs+=("$tok")
+done
+
+echo
+echo "bridge topology check:"
+for tok in ${ok_bdfs[@]+"${ok_bdfs[@]}"}; do
+	[ -z "$tok" ] && continue
+	cls=$(cat "/sys/bus/pci/devices/$tok/class" 2>/dev/null)
+	[ "$(printf '0x%04x' $(( cls >> CLASS_SHIFT )))" = "0x0604" ] || continue
+	found=no
+	for other in ${ok_bdfs[@]+"${ok_bdfs[@]}"}; do
+		[ "$other" = "$tok" ] && continue
+		ocls=$(cat "/sys/bus/pci/devices/$other/class" 2>/dev/null)
+		[ "$(printf '0x%04x' $(( ocls >> CLASS_SHIFT )))" = "0x0604" ] && continue
+		is_below "$other" "$tok" && { found="yes (via $other)"; break; }
+	done
+	printf '  %-14s %s\n' "$tok" "$found"
+	[ "$found" = "no" ] && refuse=1
+done
+
+echo
+if [ "$refuse" = "1" ]; then
+	echo "VERDICT: the module would REFUSE to load (-EINVAL). Nothing is installed, nothing changes."
+	echo "         Fix the mismatch above and re-run."
+	exit 1
+fi
+if [ "$nvidia_display" = "0" ]; then
+	echo "VERDICT: no NVIDIA display device in the list -> the module would REFUSE to load (-EINVAL)."
+	exit 1
+fi
+
+echo "VERDICT: the module would load and, at the next poweroff only, do the above."
+echo
+echo "note: the dGPU is what matters at poweroff. Right now it is in"
+printf '  %s (D0 = still awake, D3cold = rail off)\n' "$(cat /sys/bus/pci/devices/0000:01:00.0/power_state 2>/dev/null)"

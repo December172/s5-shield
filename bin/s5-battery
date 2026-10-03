@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# s5-battery: one-line power snapshot, for the before/after-shutdown arithmetic.
+# No root needed. Run it once before the shutdown and once after the next boot.
+set -u
+
+bat=""
+for d in /sys/class/power_supply/BAT*; do
+	[ -r "$d/energy_now" ] && { bat="$d"; break; }
+done
+ac=""
+for d in /sys/class/power_supply/A*; do
+	[ -r "$d/online" ] && { ac="$d"; break; }
+done
+
+if [ -z "$bat" ]; then
+	echo "no readable battery found" >&2
+	exit 1
+fi
+
+now=$(cat "$bat/energy_now")
+full=$(cat "$bat/energy_full")
+online="unknown"
+[ -n "$ac" ] && online=$(cat "$ac/online")
+
+awk -v n="$now" -v f="$full" -v ac="$online" -v t="$(date -Is)" -v u="$(cut -d' ' -f1 /proc/uptime)" \
+	'BEGIN { printf "%s  energy=%.3f Wh (%.1f%%)  ac_online=%s  uptime=%.0fs\n", t, n/1e6, (f>0?100*n/f:0), ac, u }'
+
+if [ "$online" = "1" ]; then
+	echo "NOTE: AC is connected. For a drain measurement unplug it first," >&2
+	echo "      otherwise the charger masks the S5 power draw." >&2
+fi

@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# s5-verdict: after a test shutdown, answer one question with numbers instead of
+# impressions - was the machine really off, or still burning ~20 W?
+#
+# Run it after the next boot. No root needed. It reads:
+#   - the witness block recorded during the shutdown (journal of the previous
+#     boot, or /var/log/s5-shield-witness.log),
+#   - the battery right now,
+#   and turns the two into watts over the time the machine was down.
+set -u
+
+LOG=/var/log/s5-shield-witness.log
+GPU=0000:01:00.0
+PORT=0000:00:01.1
+
+echo "== now =="
+printf '  kernel      : %s\n' "$(uname -r)"
+if lsmod | grep -qw s5_shield; then
+	printf '  s5_shield   : loaded (devs=%s)\n' "$(cat /sys/module/s5_shield/parameters/devs 2>/dev/null)"
+else
+	printf '  s5_shield   : NOT loaded\n'
+fi
+printf '  dGPU state  : %s (rpm=%s)\n' \
+	"$(cat /sys/bus/pci/devices/$GPU/power_state 2>/dev/null)" \
+	"$(cat /sys/bus/pci/devices/$GPU/power/runtime_status 2>/dev/null)"
+printf '  port state  : %s (acpi=%s)\n' \
+	"$(cat /sys/bus/pci/devices/$PORT/power_state 2>/dev/null)" \
+	"$(cat /sys/bus/pci/devices/$PORT/firmware_node/real_power_state 2>/dev/null)"
+
+echo
+echo "== what the last shutdown recorded =="
+block=""
+if [ -r "$LOG" ]; then
+	block=$(awk '/^=== .* shutdown witness ===/{b=""} {b=b $0 "\n"} END{printf "%s", b}' "$LOG")
+fi
+if [ -z "$block" ]; then
+	block=$(journalctl -b -1 -u s5-shutdown-witness.service -o cat --no-pager 2>/dev/null)
+fi
+if [ -z "$block" ]; then
+	echo "  (no witness record found: install it with)"
+	echo "      sudo ~/Tools/s5-shield/witness.sh install"
+	echo "  and shut down once so it can record the state.)"
+else
+	printf '%s\n' "$block" | sed 's/^/  /'
+fi
+
+echo
+echo "== battery arithmetic =="
+bat=""
+for d in /sys/class/power_supply/BAT*; do
+	[ -r "$d/energy_now" ] && { bat="$d"; break; }
+done
+if [ -z "$bat" ]; then
+	echo "  no readable battery"
+	exit 0
+fi
+now_e=$(awk -v n="$(cat "$bat/energy_now")" 'BEGIN{printf "%.3f", n/1e6}')
+printf '  energy now  : %s Wh\n' "$now_e"
+
+t_off=$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*=== \([0-9T:+-]*\) shutdown witness ===/\1/p' | tail -1)
+e_off=$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*battery: \([0-9.]*\) Wh.*/\1/p' | tail -1)
+ac_off=$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*ac_online: //p' | tail -1)
+
+if [ -z "${e_off:-}" ] || [ -z "${t_off:-}" ]; then
+	echo "  cannot compute: the witness record has no battery/timestamp line"
+	exit 0
+fi
+
+t_off_s=$(date -d "$t_off" +%s 2>/dev/null) || t_off_s=""
+if [ -z "$t_off_s" ]; then
+	echo "  cannot compute: unparsable timestamp '$t_off'"
+	exit 0
+fi
+now_s=$(date +%s)
+
+printf '  at shutdown : %s Wh at %s (ac_online=%s)\n' "$e_off" "$t_off" "${ac_off:-?}"
+
+# The boot witness (the unit's ExecStart) records the battery seconds after boot.
+# If the log has one that follows this shutdown, the drain across the OFF window
+# can be computed on its own - which is the only number that says anything about
+# S5. Without it, every minute of uptime since the poweroff is charged to the
+# "off" state, and a clean S5 reads several watts high.
+bootline=""
+if [ -r "$LOG" ]; then
+	bootline=$(awk -v t="$t_off" '
+		/^=== [0-9T:+-]+ (boot|shutdown) witness ===/ {
+			inboot = ($3 == "boot"); cur = $2; next
+		}
+		inboot && /^battery: / && cur > t { bt = cur; be = $2 }
+		END { if (bt != "") printf "%s %s", bt, be }
+	' "$LOG")
+fi
+
+shown_off_window=0
+if [ -n "$bootline" ]; then
+	t_boot=${bootline%% *}
+	e_boot=${bootline##* }
+	t_boot_s=$(date -d "$t_boot" +%s 2>/dev/null) || t_boot_s=""
+	if [ -n "$t_boot_s" ]; then
+		printf '  at boot     : %s Wh at %s (recorded by the unit'\''s ExecStart)\n' "$e_boot" "$t_boot"
+		awk -v e0="$e_off" -v e1="$e_boot" -v t0="$t_off_s" -v t1="$t_boot_s" -v ac="${ac_off:-?}" '
+		BEGIN {
+			d = e0 - e1; h = (t1 - t0) / 3600.0;
+			printf "  OFF window  : %.2f h\n", h;
+			printf "  energy used : %+.3f Wh\n", d;
+			if (h <= 0.05) { print "  off verdict : window too short to judge (measure over >= 0.5 h)"; exit }
+			w = d / h;
+			printf "  off draw    : %.2f W (the power-on boot itself is inside this, ~1 Wh)\n", w;
+			if (ac == 1) print "  off verdict : INVALID - the charger was connected, it masks the S5 draw";
+			else if (w > 8)  print "  off verdict : STILL POISONED (~20 W class) - the dGPU rail stayed on";
+			else if (w > 2)  print "  off verdict : borderline - between a clean S5 and a partially released rail; a longer window settles it";
+			else             print "  off verdict : CLEAN S5 - the machine was really off";
+		}'
+		shown_off_window=1
+	fi
+fi
+
+echo
+if [ "$shown_off_window" = "1" ]; then
+	echo "  (whole window below = off window + all the uptime since, for reference only)"
+else
+	echo "  (no boot witness record found - install/refresh the unit with"
+	echo "      sudo ~/Tools/s5-shield/witness.sh install"
+	echo "   so the next measurement can use the OFF window alone)"
+fi
+
+awk -v e0="$e_off" -v e1="$now_e" -v t0="$t_off_s" -v t1="$now_s" -v ac="${ac_off:-?}" -v have_off="$shown_off_window" '
+BEGIN {
+	d = e0 - e1; h = (t1 - t0) / 3600.0;
+	printf "  window      : %.2f h\n", h;
+	printf "  energy used : %+.3f Wh\n", d;
+	if (h <= 0.05) { print "  window too short to judge (measure over >= 0.5 h)"; exit }
+	w = d / h;
+	printf "  whole-window draw: %.2f W (this includes EVERY minute of uptime since the poweroff, so it always reads high)\n", w;
+	if (ac == 1) print "  whole-window note: INVALID - the charger was connected, it masks the S5 draw";
+	else if (have_off == 1) print "  whole-window note: the OFF window above is the number that matters";
+	else print "  whole-window note: not conclusive on its own - keep the witness installed so the off window can be measured";
+}'
+
+# Cross-reference the verdict with what the witness actually saw, so the next
+# step is not guesswork (see README section 7 for what each combination means).
+# Leading whitespace is tolerated because the witness formats these lines for
+# humans; the values are what matter.
+gpu_w=$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*0000:01:00\.0: state=\([^ ]*\).*/\1/p' | tail -1)
+port_w=$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*0000:00:01\.1: state=\([^ ]*\).*/\1/p' | tail -1)
+port_acpi=$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*0000:00:01\.1: acpi power_state=\([^ ]*\).*/\1/p' | tail -1)
+settled=$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*\(settled:.*\)/\1/p' | tail -1)
+if [ -n "${settled:-}" ]; then
+	echo
+	printf '  witness     : %s\n' "$settled"
+fi
+if [ -n "${gpu_w:-}" ]; then
+	echo
+	printf '  at shutdown : dGPU PCI=%s  port PCI=%s  port ACPI=%s\n' \
+		"$gpu_w" "${port_w:-?}" "${port_acpi:-?}"
+	case "$gpu_w:$port_acpi" in
+		D3cold:D3*)	echo "  reading     : the witness saw the rail released; the off draw above is the answer" ;;
+		D3cold:D0|D3hot:D0)
+				echo "  reading     : the GPU was asleep but its root port was NOT - the rail could not drop; README section 7" ;;
+		D0:*)		echo "  reading     : the witness stopped watching while the dGPU was still awake. That is expected on this machine: it does not suspend on its own, s5_shield nudges it (pm_request_idle) a moment later in the poweroff notifier. The console lines show what it reached there, and the off draw above is the answer." ;;
+		*)		echo "  reading     : unexpected combination - read the witness block above" ;;
+	esac
+fi

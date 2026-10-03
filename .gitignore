@@ -1,0 +1,18 @@
+# kernel module build artifacts (the tree is built in /usr/src by DKMS, but a
+# plain `make -C src` here would leave these behind)
+*.o
+*.ko
+*.ko.zst
+*.mod
+*.mod.c
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+
+# editor / OS noise
+*~
+*.swp
+.DS_Store

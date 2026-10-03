@@ -1,0 +1,40 @@
+[Unit]
+Description=Record the dGPU power state on the way into S5 (s5-shield witness)
+Documentation=file:///home/december172/Tools/s5-shield/README.md
+
+# DefaultDependencies=no switches OFF the implicit Conflicts=/Before= pair with
+# shutdown.target, so both have to be spelled out by hand.  Revision 1 of this
+# unit only had "Before=shutdown.target": the unit was therefore never stopped
+# during a shutdown, its ExecStop never ran, and the first two S5 tests recorded
+# nothing at all - which is why "it did not work" could not be checked either.
+Conflicts=shutdown.target
+Before=shutdown.target
+
+# Stop ordering is the reverse of start ordering, so being Before= the session
+# manager means this unit's ExecStop runs *after* it is gone, i.e. after the
+# compositor has closed /dev/nvidia0 and the dGPU is free to fall asleep.  It is
+# still before shutdown.target, so /var and journald are alive and the record
+# survives.  The script does not depend on this: it samples a timeline while it
+# waits, so a wrong ordering shows up as data instead of as silence.  Both the
+# template and this machine's instance are listed - ordering against a template
+# name alone is not something to bet a measurement on.
+Before=user@.service
+Before=user@1000.service
+Before=systemd-logind.service
+After=systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# ExecStart records the battery and the device states shortly after boot; that is
+# what lets s5-verdict compute the drain across the OFF window alone, instead of
+# charging every minute of uptime to the machine's "off" state - the arithmetic
+# that made a clean S5 read 5 W on 2026-10-03. ExecStop does the real work.
+ExecStart=/usr/local/bin/s5-shutdown-witness boot
+ExecStop=/usr/local/bin/s5-shutdown-witness
+# The witness waits for the dGPU to settle (S5_WITNESS_WAIT seconds, default 6)
+# and writes its record while / and journald are still up.
+TimeoutStopSec=40
+
+[Install]
+WantedBy=multi-user.target

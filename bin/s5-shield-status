@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# s5-shield-status: read-only check of the dGPU rail-off shield. No root needed.
+set -u
+
+GPU=0000:01:00.0
+AUD=0000:01:00.1
+BRG=0000:00:01.1
+
+drv_of() {
+	local d
+	d=$(readlink -f "/sys/bus/pci/devices/$1/driver" 2>/dev/null)
+	[ -n "$d" ] && basename "$d" || echo "(none)"
+}
+
+show() {
+	local p="/sys/bus/pci/devices/$1"
+	if [ ! -d "$p" ]; then
+		printf '  %s  -- device does not exist\n' "$1"
+		return
+	fi
+	printf '  %s  driver=%-14s class=%s  state=%-6s rpm=%-10s control=%-5s d3cold_ok=%s\n' \
+		"$1" "$(drv_of "$1")" \
+		"$(cat "$p/class" 2>/dev/null)" \
+		"$(cat "$p/power_state" 2>/dev/null)" \
+		"$(cat "$p/power/runtime_status" 2>/dev/null)" \
+		"$(cat "$p/power/control" 2>/dev/null)" \
+		"$(cat "$p/d3cold_allowed" 2>/dev/null)"
+	# runtime_active_time is the honest witness: power_state can look asleep
+	# while something (including our own probing) keeps waking the device.
+	local a s
+	a=$(cat "$p/power/runtime_active_time" 2>/dev/null)
+	s=$(cat "$p/power/runtime_suspended_time" 2>/dev/null)
+	[ -n "${a:-}" ] && printf '        active_ms=%s suspended_ms=%s\n' "$a" "${s:-?}"
+}
+
+echo "== kernel =="
+printf '  running : %s\n' "$(uname -r)"
+if [ -d "/lib/modules/$(uname -r)/build" ]; then
+	printf '  headers : %s\n' "/lib/modules/$(uname -r)/build"
+else
+	printf '  headers : MISSING for the running kernel (a module cannot be built for it)\n'
+fi
+
+echo "== dGPU subtree =="
+show "$GPU"
+show "$AUD"
+show "$BRG"
+
+echo "== module =="
+work_src="$(dirname "$0")/../src/s5_shield.c"
+# Whatever version is installed under /usr/src (the packager name carries it).
+inst_src="$(ls -1t /usr/src/s5-shield-*/s5_shield.c 2>/dev/null | head -1)"
+# Compare functional content: MODULE_VERSION is cosmetic and is ignored, so the
+# check does not cry wolf over a one-line difference.
+fhash() { grep -v '^MODULE_VERSION' "$1" 2>/dev/null | sha256sum | cut -c1-16; }
+if [ -z "$inst_src" ]; then
+	printf '  source  : nothing installed under /usr/src/s5-shield-*\n'
+elif [ -f "$work_src" ]; then
+	a=$(fhash "$inst_src"); b=$(fhash "$work_src")
+	if [ "$a" = "$b" ]; then
+		printf '  source  : installed copy matches this tree (%s)\n' "$a"
+	else
+		printf '  source  : installed %s != this tree %s   <-- STALE: re-run install.sh\n' "$a" "$b"
+	fi
+fi
+if lsmod | grep -qw s5_shield; then
+	echo "  loaded  : yes (srcversion $(cat /sys/module/s5_shield/srcversion 2>/dev/null))"
+	printf '  devs    : %s\n' "$(cat /sys/module/s5_shield/parameters/devs 2>/dev/null)"
+	printf '  noshut  : %s\n' "$(cat /sys/module/s5_shield/parameters/noshut 2>/dev/null)"
+	# wait_ms only exists from revision 1.3 on; its absence means the module in
+	# the kernel is older than this tree - check the source line above for STALE.
+	if [ -r /sys/module/s5_shield/parameters/wait_ms ]; then
+		printf '  wait_ms : %s  (at poweroff: wait for D3cold before disabling runtime PM)\n' \
+			"$(cat /sys/module/s5_shield/parameters/wait_ms)"
+	else
+		printf '  wait_ms : ABSENT - the loaded module predates revision 1.3: re-run install.sh\n'
+	fi
+else
+	echo "  loaded  : no"
+fi
+
+echo "== configuration =="
+for f in /etc/modprobe.d/s5-shield.conf /etc/modules-load.d/s5-shield.conf; do
+	[ -f "$f" ] && echo "  present : $f" || echo "  missing : $f"
+done
+if dkms status 2>/dev/null | grep -q '^s5-shield'; then
+	dkms status 2>/dev/null | grep '^s5-shield' | sed 's/^/  dkms    : /'
+else
+	echo "  dkms    : not registered"
+fi
+
+echo "== verdict =="
+if lsmod | grep -qw s5_shield; then
+	echo "  Shield is loaded. It will act on the next poweroff only (a reboot is untouched)."
+	echo "  During shutdown the last console lines should read:"
+	echo "    s5-shield: <bdf> reached D3cold after <n> ms"
+	echo "    s5-shield: <bdf> state=D3cold driver=nvidia"
+	echo "    s5-shield: done: runtime PM off on 3, .shutdown nulled on 2, skipped 0"
+	echo "  Judge it on the OFF window only: ~/Tools/s5-shield/bin/s5-battery before,"
+	echo "  poweroff, wait 30-60 min, power on, then ~/Tools/s5-shield/bin/s5-verdict."
+else
+	echo "  Shield is NOT loaded: a poweroff behaves as before (chassis stays warm)."
+fi
