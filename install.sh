@@ -48,16 +48,6 @@ install -d -m755 "$TARGET"
 install -m644 "$SRC_DIR/src/s5_shield.c" "$SRC_DIR/src/Makefile" "$SRC_DIR/src/dkms.conf" "$TARGET/"
 ls -la "$TARGET"
 
-# Keep exactly one source tree for this package: an older /usr/src/s5-shield-*
-# left behind is what bin/s5-shield-status would compare against (it reads the
-# newest one), so it is removed here rather than left to confuse that check.
-for d in /usr/src/"$PKG"-*; do
-	[ -d "$d" ] || continue
-	[ "$d" = "$TARGET" ] && continue
-	rm -rf "$d"
-	echo "  removed stale $d"
-done
-
 echo
 echo "=== 1b. source/hardware self-check ==="
 if ! "$SRC_DIR/bin/s5-shield-dryrun"; then
@@ -90,9 +80,27 @@ old="$(dkms status 2>/dev/null | sed -n "s|^${PKG}/\([^,]*\),.*|\1|p" | sort -u)
 if [ -n "$old" ]; then
 	echo "already registered with DKMS ($(echo $old | tr '\n' ' ')): removing it first so the new source is really rebuilt"
 	for v in $old; do
-		dkms remove "${PKG}/${v}" --all
+		# If this fails (say the source tree is already gone) the registration
+		# is left behind as "broken" in every future `dkms status`, so it is
+		# said out loud instead of swallowed.
+		dkms remove "${PKG}/${v}" --all || \
+			echo "  !! dkms remove ${PKG}/${v} failed; if it stays 'broken', remove it with: sudo dkms remove ${PKG}/${v} --all"
 	done
 fi
+
+# Keep exactly one source tree for this package: an older /usr/src/s5-shield-*
+# left behind is what bin/s5-shield-status would compare against (it reads the
+# newest one), and what DKMS would keep rebuilding on every kernel update. Va
+# DESPUES de los `dkms remove` a proposito: dkms remove necesita el arbol para
+# desregistrar, y borrarlo antes deja la version clavada como "broken" para
+# siempre (paso el 2026-10-04, con esta misma linea tres pantallas mas arriba).
+for d in /usr/src/"$PKG"-*; do
+	[ -d "$d" ] || continue
+	[ "$d" = "$TARGET" ] && continue
+	rm -rf "$d"
+	echo "  removed stale $d"
+done
+
 dkms add "${PKG}/${VER}"
 dkms build   "${PKG}/${VER}" -k "$KVER"
 dkms install "${PKG}/${VER}" -k "$KVER"
