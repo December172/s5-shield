@@ -42,7 +42,7 @@ again *after* it). A patched kernel would work but means touching signed boot im
 
 ## The fix
 
-One out-of-tree module, `s5_shield` (498 lines of code in an 870-line file that is mostly the
+One out-of-tree module, `s5_shield` (503 lines of code in an 883-line file that is mostly the
 reasoning, GPL-2.0, `src/s5_shield.c`). It registers a **reboot notifier**, which
 `kernel_power_off()` runs *before* `device_shutdown()` (`kernel/reboot.c:303-310`), so by the time
 the PCI core walks the device list it has already:
@@ -211,6 +211,15 @@ disable depth this module itself raises when it arms, `auto=` is the `power/cont
 `acpi=` is the ACPI power state of the same device — the platform-side half of "is the rail off".
 The arming-time `D0` on its own is **not** an alarm: only the `FINAL` line decides.
 
+The `FINAL` lines are printed immediately before the firmware is asked to power off, so they are on
+screen only for as long as the S5 transition takes. To photograph them at leisure, load the module
+with the diagnostic hold — it changes nothing else, and the next reboot drops it again:
+
+```bash
+sudo modprobe -r s5_shield && sudo modprobe s5_shield final_hold_ms=8000
+# ... now power off and photograph the screen; nothing to undo afterwards
+```
+
 ## Result (2026-10-03)
 
 First instrumented poweroff: 11:51:04 → 12:41:07, **50 minutes off**, on battery with the charger
@@ -264,10 +273,9 @@ them. The witness unit had a fourth such bug: with `DefaultDependencies=no` and 
 
 | path | what it is |
 |---|---|
-| `src/s5_shield.c` | the whole fix: one reboot notifier plus two diagnostics, 498 lines of code, GPL-2.0 |
+| `src/s5_shield.c` | the whole fix: one reboot notifier plus two diagnostics, 503 lines of code, GPL-2.0 |
 | `src/{Makefile,dkms.conf}` | build and DKMS packaging for it |
-| `etc/modprobe.d/s5-shield.conf` | the device list (`devs=`), the driver list (`noshut=`), `wait_ms=` |
-| `etc/modules-load.d/s5-shield.conf` | loads the module at boot |
+| `etc/modprobe.d/s5-shield.conf` | the device list (`devs=`), the driver list (`noshut=`), `wait_ms=` || `etc/modules-load.d/s5-shield.conf` | loads the module at boot |
 | `install.sh`, `uninstall.sh` | the only two things you have to run |
 | `witness.sh` | installs/removes the optional shutdown witness |
 | `systemd/s5-shutdown-witness.service` | the witness unit (boot record + shutdown record) |

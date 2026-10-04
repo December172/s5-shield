@@ -150,6 +150,17 @@ static unsigned int wait_ms;
 module_param(wait_ms, uint, 0444);
 MODULE_PARM_DESC(wait_ms, "At poweroff, wait up to this many ms for the display device to settle before runtime PM is disabled (0 = do not wait, the default)");
 
+/*
+ * Diagnostic knob, 0 by default.  The FINAL lines are the last thing printed
+ * before the firmware is asked to power off, so without a hold they are on
+ * screen only for as long as the ACPI S5 transition takes - long enough to miss
+ * them.  This keeps them there for a photograph and changes nothing else; it
+ * costs exactly this much extra shutdown time.
+ */
+static unsigned int final_hold_ms;
+module_param(final_hold_ms, uint, 0444);
+MODULE_PARM_DESC(final_hold_ms, "After printing the FINAL lines, wait this many ms before the poweroff continues (0 = no hold; diagnostic only)");
+
 /* Drivers this module refuses to touch, no matter what the device list says. */
 static const char *const protected_drivers[] = {
 	"amdgpu", "i915", "xe", "nouveau",	/* never the integrated GPU */
@@ -672,6 +683,9 @@ static int s5_shield_observe_final(struct sys_off_data *data)
 			  acpi_state(pdev), dn ? dn : "(no driver)", acc);
 		device_unlock(&pdev->dev);
 	}
+
+	if (final_hold_ms)
+		msleep(final_hold_ms);
 
 	return NOTIFY_DONE;
 }
