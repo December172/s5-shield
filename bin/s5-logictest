@@ -18,8 +18,9 @@ WORK=$(mktemp -d /tmp/s5-logictest.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
 IDS=""
+BUILD=""
 for d in /lib/modules/"$(uname -r)"/build /lib/modules/*/build; do
-	[ -f "$d/include/linux/pci_ids.h" ] && { IDS="$d/include/linux/pci_ids.h"; break; }
+	[ -f "$d/include/linux/pci_ids.h" ] && { IDS="$d/include/linux/pci_ids.h"; BUILD="$d"; break; }
 done
 [ -n "$IDS" ] || { echo "no kernel headers with pci_ids.h found" >&2; exit 1; }
 
@@ -105,3 +106,124 @@ gcc -O1 -Wall -Wextra -Wno-unused-parameter -include "$IDS" -o "$WORK/harness" "
 
 echo
 "$WORK/harness" "$c_gpu" "$c_aud" "$c_brg"
+
+# ---------------------------------------------------------------------------
+# Second test: the runtime PM diagnostics, compiled out of the same source.
+#
+# The blocker line is what every "why is it still awake" conclusion is read
+# through, so the same rule applies as above: compile the real function, do not
+# mirror it.  The only things supplied here are the enum (extracted from the
+# kernel's own include/linux/pm.h, never copied) and two-line stand-ins for the
+# kernel types a userspace compile cannot include.
+# ---------------------------------------------------------------------------
+PMH="$BUILD/include/linux/pm.h"
+[ -f "$PMH" ] || { echo "no include/linux/pm.h next to pci_ids.h" >&2; exit 1; }
+
+for fn in rpm_name rpm_blocker; do
+	body=$(extract "$fn")
+	if [ -z "$body" ]; then
+		echo "cannot extract $fn() from $SRC - refusing to guess" >&2
+		exit 1
+	fi
+	printf '%s\n' "$body" >"$WORK/$fn.inc"
+done
+
+sed -n '/^enum rpm_status {/,/^};/p' "$PMH" >"$WORK/rpm_status.inc"
+[ -s "$WORK/rpm_status.inc" ] || { echo "cannot read enum rpm_status from $PMH" >&2; exit 1; }
+
+{
+	echo '#include <stdio.h>'
+	echo '#include <stdbool.h>'
+	echo '#include <string.h>'
+	cat "$WORK/rpm_status.inc"
+	cat <<'EOF'
+typedef struct { int counter; } atomic_t;
+#define atomic_read(a) ((a)->counter)
+
+/* the fields rpm_blocker() and rpm_accounting() read, nothing else */
+struct dev_pm_info {
+	atomic_t usage_count;
+	atomic_t child_count;
+	unsigned int disable_depth;
+	bool runtime_auto;
+	bool ignore_children;
+	enum rpm_status runtime_status;
+};
+
+struct device {
+	struct dev_pm_info power;
+	struct device *parent;
+};
+EOF
+	cat "$WORK/rpm_name.inc"
+	cat "$WORK/rpm_blocker.inc"
+	cat <<'EOF'
+static int fails;
+
+static void check(const char *what, struct device *d, const char *want)
+{
+	const char *got = rpm_blocker(d);
+	bool ok = strstr(got, want) != NULL;
+
+	printf("  %-36s -> %-70s %s\n", what, got, ok ? "OK" : "FAIL");
+	if (!ok)
+		fails++;
+}
+
+int main(void)
+{
+	struct device d;
+
+	/* and the names come from the kernel's enum, not from a copy of it */
+	printf("  enum sanity: RPM_ACTIVE=%d -> %s, RPM_SUSPENDED=%d -> %s\n",
+	       RPM_ACTIVE, rpm_name(RPM_ACTIVE), RPM_SUSPENDED, rpm_name(RPM_SUSPENDED));
+	if (strcmp(rpm_name(RPM_ACTIVE), "active") ||
+	    strcmp(rpm_name(RPM_SUSPENDED), "suspended")) {
+		printf("  enum sanity FAILED - pm.h no longer matches what this line prints\n");
+		fails++;
+	}
+
+	memset(&d, 0, sizeof(d));
+	d.power.runtime_status = RPM_ACTIVE;
+	check("idle, nothing holding it", &d, "none in the runtime PM accounting");
+
+	memset(&d, 0, sizeof(d));
+	d.power.runtime_status = RPM_ACTIVE;
+	d.power.disable_depth = 1;
+	d.power.usage_count.counter = 2;
+	check("disabled, and also in use", &d, "-EACCES");
+
+	memset(&d, 0, sizeof(d));
+	d.power.runtime_status = RPM_ACTIVE;
+	d.power.usage_count.counter = 1;
+	d.power.child_count.counter = 1;
+	check("a held reference, and a child too", &d, "-EAGAIN");
+
+	memset(&d, 0, sizeof(d));
+	d.power.runtime_status = RPM_ACTIVE;
+	d.power.child_count.counter = 1;
+	check("active child (the root port's case)", &d, "-EBUSY");
+
+	memset(&d, 0, sizeof(d));
+	d.power.runtime_status = RPM_ACTIVE;
+	d.power.ignore_children = true;
+	d.power.child_count.counter = 1;
+	check("a child, but ignore_children is set", &d, "none in the runtime PM accounting");
+
+	memset(&d, 0, sizeof(d));
+	d.power.runtime_status = RPM_SUSPENDED;
+	check("already suspended", &d, "not active");
+
+	printf("\n%s\n", fails ? "RESULT: FAIL - rpm_blocker() would name the wrong cause"
+			       : "RESULT: OK - rpm_blocker() names each cause, in the kernel's own precedence");
+	return fails ? 1 : 0;
+}
+EOF
+} >"$WORK/rpm_harness.c"
+
+echo
+echo "compiling the runtime PM diagnostics from src/s5_shield.c with $(basename "$PMH") ..."
+gcc -O1 -Wall -Wextra -Wno-unused-parameter -o "$WORK/rpm_harness" "$WORK/rpm_harness.c"
+
+echo
+"$WORK/rpm_harness"

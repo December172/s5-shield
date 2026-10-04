@@ -72,8 +72,12 @@ if lsmod | grep -qw s5_shield; then
 	# wait_ms only exists from revision 1.3 on; its absence means the module in
 	# the kernel is older than this tree - check the source line above for STALE.
 	if [ -r /sys/module/s5_shield/parameters/wait_ms ]; then
-		printf '  wait_ms : %s  (at poweroff: wait for D3cold before disabling runtime PM)\n' \
-			"$(cat /sys/module/s5_shield/parameters/wait_ms)"
+		wm=$(cat /sys/module/s5_shield/parameters/wait_ms)
+		if [ "$wm" = 0 ]; then
+			printf '  wait_ms : 0  (revision 1.4 default: no wait; the FINAL line reports what the device walk did)\n'
+		else
+			printf '  wait_ms : %s  (the revision 1.3 experiment; it timed out on this laptop and only delays the poweroff)\n' "$wm"
+		fi
 	else
 		printf '  wait_ms : ABSENT - the loaded module predates revision 1.3: re-run install.sh\n'
 	fi
@@ -107,11 +111,12 @@ echo "== verdict =="
 if lsmod | grep -qw s5_shield; then
 	echo "  Shield is loaded. It will act on the next poweroff only (a reboot is untouched)."
 	echo "  During shutdown the last console lines should read:"
-	echo "    s5-shield: <bdf> reached D3cold after <n> ms"
-	echo "    s5-shield: <bdf> state=D3cold driver=nvidia"
+	echo "    s5-shield: <bdf> state=D0 acpi=D0 driver=nvidia rpm=active use=<n> child=<n> dis=0 auto=yes"
 	echo "    s5-shield: done: runtime PM off on 3, .shutdown nulled on 2, skipped 0"
-	echo "  Judge it on the OFF window only: $HERE/bin/s5-battery before,"
-	echo "  poweroff, wait 30-60 min, power on, then $HERE/bin/s5-verdict."
+	echo "    s5-shield: FINAL <bdf> pci=D3cold acpi=D3cold driver=nvidia rpm=suspended use=0 ..."
+	echo "  The arming line says why the device was awake; the FINAL line says where it"
+	echo "  ended up (README: Reading the console). Judge it on the OFF window only:"
+	echo "  $HERE/bin/s5-battery before, poweroff, wait 30-60 min, power on, then $HERE/bin/s5-verdict."
 else
 	echo "  Shield is NOT loaded: a poweroff behaves as before (chassis stays warm)."
 fi

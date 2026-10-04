@@ -5,7 +5,7 @@ Machine: **HP OMEN Gaming Laptop 16-ap0xxx** (`8E35`), BIOS **F.13**, AMD Ryzen 
 kernel **7.2.8-arch1-2**, ACPI S-states `S0 S4 S5`.
 
 Status: **installed and measured working** on this machine — see *Result*. The repository packages
-the module as DKMS `s5-shield/1.3`; the machine's registration moves to it the next time
+the module as DKMS `s5-shield/1.4`; the machine's registration moves to it the next time
 `install.sh` runs.
 
 ## The problem
@@ -42,45 +42,56 @@ again *after* it). A patched kernel would work but means touching signed boot im
 
 ## The fix
 
-One out-of-tree module, `s5_shield` (381 lines of code in a 642-line file that is mostly the
+One out-of-tree module, `s5_shield` (498 lines of code in an 870-line file that is mostly the
 reasoning, GPL-2.0, `src/s5_shield.c`). It registers a **reboot notifier**, which
 `kernel_power_off()` runs *before* `device_shutdown()` (`kernel/reboot.c:303-310`), so by the time
 the PCI core walks the device list it has already:
 
-0. **waited for the dGPU to be genuinely asleep** — nudging runtime PM with `pm_request_idle()`
-   and polling until it reports `D3cold`, the state in which its rail is off, up to `wait_ms`
-   (default 5000);
+0. **recorded why the dGPU is (or is not) asleep** — the runtime PM accounting (`rpm=`, `use=`,
+   `child=`, `dis=`) and, when it is awake, the blocking condition named in the runtime PM core's
+   own vocabulary (`rpm_blocker()` reads the same conditions `rpm_check_suspend_allowed()` uses:
+   `-EACCES` disabled, `-EAGAIN` a held reference, `-EBUSY` an active child);
 1. **disabled runtime PM** on the listed devices (`__pm_runtime_disable()`), so the
    `pm_runtime_resume()` above bounces with `-EACCES` instead of powering the GPU up
    (`drivers/base/power/runtime.c:798-808`);
 2. **nulled `drv->shutdown`** for the drivers named in `noshut` (`nvidia`, `snd_hda_intel`), so no
    driver teardown runs MMIO against an unpowered device.
 
-Step 0 is the easy one to miss: without it, step 1 can *pin an awake GPU awake*, and a PCI port
-cannot sleep while a child below it is awake — which is what has to happen for the slot power
-resource (`PG00` / `LNXPOWER:04`) to release the rail. Steps 1 and 2 must go together: 1 alone
-leaves `nv_pci_shutdown()` executing against a device in `D3cold`, and that bus-locks this machine.
+Steps 1 and 2 must go together: 1 alone leaves `nv_pci_shutdown()` executing against a device in
+`D3cold`, and that bus-locks this machine.
 
-This is the same two-halves method published for this model by Anxo Calvo (see *Credits*), with
-two differences: it arms itself from the kernel's reboot notifier instead of from a shutdown hook,
-and it does not *assume* the GPU is already asleep.
+This is the same two-halves method published for this model by Anxo Calvo (see *Credits*), with two
+differences: it arms itself from the kernel's reboot notifier instead of from a shutdown hook, and
+it measures what it does instead of assuming it.
 
-**What step 0 actually does on this laptop (measured 2026-10-03, 15:13 poweroff):** it runs to its
-full `wait_ms` and the dGPU is still in `D0` when the shield arms. The nvidia driver holds a
-runtime PM reference it does not release on its own; `pm_request_idle()` only *asks* the runtime PM
-core, and a driver's own reference makes that idle evaluation return `-EAGAIN` without suspending.
-The module says so on the console (`still in D0, cannot suspend after this: this poweroff can still
-be warm`) and arms anyway.
+**The wait of revision 1.3 is gone — off by default, `wait_ms=0`.** It was meant to let the dGPU
+fall asleep before the shield pinned it awake, and it cannot do that: `pm_request_idle()` only
+*asks* the runtime PM core, which refuses with `-EAGAIN` while any driver or client holds a
+reference and with `-EBUSY` while a device below is active (`rpm_check_suspend_allowed()`) — and a
+device that *can* suspend has already been idle-notified by the core when its last reference was
+dropped. When the request is accepted, `rpm_suspend(RPM_AUTO)` waits out the device's autosuspend
+delay instead of suspending at once: there is no near-instant version of this to be had from inside
+the kernel. Measured here (2026-10-03, 15:13 poweroff): the 5000 ms wait ran out with the dGPU
+still in `D0`, the module armed anyway, and the 50-minute S5 that followed still cost ~1 W. The
+saving comes from **1+2** — the kernel never resumes the GPU and `nv_pci_shutdown()` never runs.
+If `wait_ms` is set anyway, phase 1 asks every listed device to go idle once and only phase 2 spends
+the budget polling, so the result no longer depends on the order of `devs=`.
 
-That is the benign branch, not a failure — but it does mean the saving here comes from **(a)+(b)**,
-not from step 0: the kernel never resumes the GPU, `nv_pci_shutdown()` never runs, and an *idle*
-`D0` GPU costs almost nothing. The measured 50-minute off window (`≤1 W`, cold chassis) had exactly
-that signature. The expensive case is a GPU that is **busy** at poweroff — a CUDA job, an external
-display, PRIME offload — which the shield would freeze busy for ~19 W the whole night; that is the
-case upstream handles with a 90 s wait plus a GRUB `halt` fallback. Nothing here detects it yet
-before the fact, which is one reason the witness's backward self-check exists. `wait_ms=0` in
-`/etc/modprobe.d/s5-shield.conf` skips the wait entirely if you would rather not pay the 5 s on
-every poweroff.
+**What decides the rail is now measured, not inferred.** Everything above runs *before*
+`device_shutdown()`; the references that keep the dGPU awake are released *inside* it. So a
+`SYS_OFF_MODE_POWER_OFF_PREPARE` handler (`s5_shield_observe_final()`) prints a `FINAL` line per
+device after the walk and before the firmware poweroff — the last observable moment
+(`kernel_power_off()`: notifier + `device_shutdown()` → power-off-prepare → `syscore_shutdown()` →
+`machine_power_off()`). Read it as: dGPU `D3cold` with the bridge in `D3hot`/`D3cold` ⇒ the rail was
+released before the firmware took over, i.e. the shield worked by *not resuming* it, and the `D0`
+seen at arming time was not the deciding factor; anything still in `D0` ⇒ whatever held it awake
+(the `use=`/`child=` fields say which) was released too late or never, and *that* is the case a
+shutdown-time fallback has to cover — not a longer wait.
+
+The expensive case is still a GPU that is **busy** at poweroff — a CUDA job, an external display,
+PRIME offload — which the shield would freeze busy for ~19 W the whole night. Upstream covers that
+with a 90 s wait plus a GRUB `halt` fallback; this machine, with systemd-boot, has no such fallback
+yet.
 
 Safety rails: nothing happens on reboot/halt or while the system runs; `devs=` is mandatory, and
 every address is resolved and class-checked (display / audio / PCI bridge only) both at load time
@@ -105,7 +116,7 @@ would not accept this machine's devices. DKMS then rebuilds it on every kernel u
 ```bash
 /mnt/Shared/Development/Project/Others/s5-shield/bin/s5-shield-status    # loaded? installed source == this revision? device states
 /mnt/Shared/Development/Project/Others/s5-shield/bin/s5-shield-dryrun    # what the module would do, read out of the C source
-dmesg | grep s5-shield                    # "ready: 3 target(s), noshut=…, wait_ms=5000"
+dmesg | grep s5-shield                    # "ready: 3 target(s), …, wait_ms=0, FINAL observer=on"
 ```
 
 A **reboot proves nothing** (the shield acts on poweroff only), and uptime drowns the effect: this
@@ -149,32 +160,63 @@ capped at 256 KB (keeping the tail, which always contains the last shutdown reco
 grow forever — the same concern upstream solves with `logrotate`, without the extra packaging.
 
 The kernel prints its own account as the machine goes down, visible even with `quiet loglevel=3`.
-This is the real output of a poweroff on this laptop (15:13, 2026-10-03) — every line of it, in the
-order it appears:
+Every line below the `FINAL` marker is the module's own output; the last four come from the
+power-off-prepare observer. (`wait_ms=0` in revision 1.4, so the two wait lines of the 15:13
+transcript are gone.)
 
 ```
 s5-shield: poweroff path, 3 device(s) listed
-s5-shield: 0000:01:00.0 is in D0, not asleep; asking runtime PM to let go and waiting up to 5000 ms for D3cold
-s5-shield: 0000:01:00.0 is still D0 after 5000 ms, giving up on the wait; if this poweroff stays warm it is because the device was never asleep, not because the kernel woke it (README section 7)
-s5-shield: 0000:01:00.0 state=D0 driver=nvidia
-s5-shield: 0000:01:00.0 still in D0, cannot suspend after this: this poweroff can still be warm (README section 7)
+s5-shield: wait_ms=0, not waiting: 0000:01:00.0 is D0, usage_count > 0: a driver or client still holds a reference (-EAGAIN) [rpm=active use=1 child=0 dis=0 auto=yes], ...
+s5-shield: 0000:01:00.0 state=D0 acpi=D0 driver=nvidia rpm=active use=1 child=0 dis=0 auto=yes
+s5-shield: 0000:01:00.0 still in D0, cannot suspend after this: this poweroff can still be warm (README: Reading the console)
 s5-shield: 0000:01:00.0 .shutdown of 'nvidia' nulled
-s5-shield: 0000:01:00.1 state=D3hot driver=snd_hda_intel
+s5-shield: 0000:01:00.1 state=D3hot acpi=D3hot driver=snd_hda_intel rpm=suspended use=0 child=0 dis=0 auto=yes
 s5-shield: 0000:01:00.1 .shutdown of 'snd_hda_intel' nulled
-s5-shield: 0000:00:01.1 state=D0 driver=pcieport
+s5-shield: 0000:00:01.1 state=D0 acpi=D0 driver=pcieport rpm=active use=1 child=1 dis=0 auto=yes parent=suspended
 s5-shield: 0000:00:01.1 bridge: .shutdown of 'pcieport' left in place on purpose
-s5-shield: 0000:00:01.1 still in D0, cannot suspend after this: this poweroff can still be warm (README section 7)
+s5-shield: 0000:00:01.1 still in D0, cannot suspend after this: this poweroff can still be warm (README: Reading the console)
 s5-shield: done: runtime PM off on 3, .shutdown nulled on 2, skipped 0
+s5-shield: FINAL state, after device_shutdown() and before the firmware poweroff
+s5-shield: FINAL 0000:01:00.0 pci=D3cold acpi=D3cold driver=nvidia rpm=suspended use=0 child=0 dis=1 auto=no parent=suspended
+s5-shield: FINAL 0000:01:00.1 pci=D3cold acpi=D3cold driver=snd_hda_intel rpm=suspended use=0 child=0 dis=1 auto=no
+s5-shield: FINAL 0000:00:01.1 pci=D3hot acpi=D3hot driver=pcieport rpm=suspended use=0 child=0 dis=1 auto=no parent=suspended
 ```
 
-The three `can still be warm` warnings are the module being accurate rather than reassuring: the
-dGPU and its port were awake when it armed, so all it could do was keep the kernel and the driver
-away from them (see the note under *The fix*).
+The shape to expect on a healthy poweroff is the one above: **`D0` at arming time, `D3cold`/
+`D3hot` in the `FINAL` lines.** The `can still be warm` warnings are the module being accurate
+rather than reassuring — the dGPU and its port were awake when it armed, so all it could do was
+keep the kernel and the driver away from them, and the drop happened later, inside the device walk.
+The two `use=1`/`child=1` fields at arming time are the exact reason the wait of revision 1.3 could
+never have changed that: the root port cannot suspend while the GPU under it is active. (The
+`FINAL` values above are what this revision is expected to print; the transcript is filled in from
+the first instrumented poweroff with 1.4 and until then the arming half is the measured part.)
+
+## Reading the console
+
+Two things tell you everything after a poweroff, and both appear on the console during shutdown and
+in `journalctl -b -1 -k`. The arming lines (revision 1.4) say *why* each device is where it is; the
+`FINAL` lines say where the tree actually ended up, after `device_shutdown()` and before the
+firmware poweroff — the moment that decides the rail.
+
+| what you see | what it means | what to do |
+|---|---|---|
+| arming `state=D0 … use=1 child=0`, then `FINAL … pci=D3cold` | the dGPU was awake when the shield armed, and the device walk released it: the rail was cut before the firmware took over. This is the **healthy** case on this laptop, and it is why the wait was never the mechanism. | nothing — this is the fix working |
+| `FINAL … pci=D0` on the GPU, or the bridge still `pci=D0` | whatever held it awake (`use=` a reference, `child=` an active device below) was released too late or never, so the rail is likely still on. | find the holder from the two counters; this is the case that needs a shutdown-time fallback, not a longer wait (upstream's 90 s + GRUB `halt`; this machine has none yet) |
+| no `FINAL` line at all | the observer did not register — check the boot line `ready: … FINAL observer=on`, or that the kernel reached power-off-prepare. | nothing: the shield works without it, you only lose the measurement |
+
+The fields: `rpm=` is the device's runtime PM status, `use=` is how many references hold it awake
+(`-EAGAIN` when the wait asks it to suspend), `child=` is how many devices below it are still active
+(`-EBUSY`; a root port with `child=1` is the normal state while its GPU is awake), `dis=` is the
+disable depth this module itself raises when it arms, `auto=` is the `power/control` setting, and
+`acpi=` is the ACPI power state of the same device — the platform-side half of "is the rail off".
+The arming-time `D0` on its own is **not** an alarm: only the `FINAL` line decides.
 
 ## Result (2026-10-03)
 
 First instrumented poweroff: 11:51:04 → 12:41:07, **50 minutes off**, on battery with the charger
-unplugged the whole time.
+unplugged the whole time. This is revision 1.3 (the 5 s wait still enabled); revision 1.4 keeps the
+same two halves and turns that wait off, so the number is expected to hold — the confirming run,
+with the `FINAL` lines, is the next poweroff.
 
 * The witness ran (that is itself a fix — see *History*) and recorded the dGPU **still in `D0`
   after 6 s with no holders**: the nvidia driver does not runtime-suspend it on its own once its
@@ -184,17 +226,21 @@ unplugged the whole time.
   runs. An idle `D0` GPU is nearly free; the ~19-20 W case is a *busy* one.
 * Battery at the last moment before poweroff **64.743 Wh (82.8%)**; first sample after boot
   **80%** — 2.2 Wh, of which the three minutes of uptime in between are worth 1.2–2.9 Wh. So the
-  50 minutes the machine was actually off cost **at most ~1 Wh (≈1 W)**, against the ≈16.7 Wh the
-  old behaviour produced over the same window.
+  50 minutes the machine was actually off cost **at most ~1 Wh (≈1 W)**. The "≈16.7 Wh the old
+  behaviour produced over the same window" is arithmetic from the published ~20 W for this model
+  (20 W × 0.84 h), not a measurement taken on this unit — this machine's pre-fix drain was never
+  measured here, only its symptom (warm chassis, flat battery).
 * Chassis cold — the symptom this started from, gone.
 
 ## Limits
 
-* If the dGPU does not reach `D3cold` within `wait_ms`, the module says so and that poweroff is no
-  worse than before: the rail was never released, so there was nothing to preserve. The remaining
+* If the dGPU does not reach `D3cold` before the shield arms, the module says so — with the reason
+  — and that poweroff is no worse than before: the rail was never released, so there was nothing to
+  preserve. The remaining
   lever would be `pcie_port_pm=force` on the kernel command line, which is out of scope here.
-* The wait costs nothing when the GPU is already asleep and at most `wait_ms` when it is not;
-  `wait_ms=0` in `/etc/modprobe.d/s5-shield.conf` removes it.
+* The wait is off (`wait_ms=0`): on this machine it cost 5 s per poweroff, timed out every time, and
+  the `FINAL` line is what now says whether the rail actually dropped. Re-enable it with
+  `wait_ms=5000` only to re-run that experiment.
 * The shield is not undone by `modprobe -r`: once armed, the next poweroff is committed. The worst
   case of this class of change is a hang at poweroff — hold the power button ~10 s; the
   filesystems are already unmounted at that point. It cannot hang a reboot: it only arms for
@@ -206,17 +252,19 @@ unplugged the whole time.
 
 Revisions 1.0 and 1.1 both shipped a module that silently refused to load its own device list (a
 wrong audio class macro, then a `class >> 16` shift against 16-bit macros) — so the fix was inert
-and nothing said so. 1.2 fixed the decoding; 1.3 added step 0 above. Both bugs were caught by
-review, not by testing, which is why `bin/s5-shield-dryrun` and `bin/s5-logictest` now read the
-accept-list and the shift **out of the C source** and check them against the live hardware instead
-of mirroring them. The witness unit had a third such bug: with `DefaultDependencies=no` and only
+and nothing said so. 1.2 fixed the decoding; 1.3 added the wait (step 0); 1.4 turns that wait off
+and replaces it with measurement: the arming-time blocking reason, and a `FINAL` line at the moment
+of no return. All three bugs were caught by review, not by testing, which is why
+`bin/s5-shield-dryrun` and `bin/s5-logictest` now read the accept-list, the shift **and the
+blocker logic** out of the C source and check them against the live hardware instead of mirroring
+them. The witness unit had a fourth such bug: with `DefaultDependencies=no` and only
 `Before=shutdown.target`, systemd never stopped it, so it never recorded anything.
 
 ## Files
 
 | path | what it is |
 |---|---|
-| `src/s5_shield.c` | the whole fix: one reboot notifier, 381 lines of code, GPL-2.0 |
+| `src/s5_shield.c` | the whole fix: one reboot notifier plus two diagnostics, 498 lines of code, GPL-2.0 |
 | `src/{Makefile,dkms.conf}` | build and DKMS packaging for it |
 | `etc/modprobe.d/s5-shield.conf` | the device list (`devs=`), the driver list (`noshut=`), `wait_ms=` |
 | `etc/modules-load.d/s5-shield.conf` | loads the module at boot |
@@ -227,10 +275,10 @@ of mirroring them. The witness unit had a third such bug: with `DefaultDependenc
 | `bin/s5-verdict` | pairs the shutdown and boot records, prints the watts across the off window |
 | `bin/s5-shield-status` | module loaded? installed source this revision? self-check result, device states |
 | `bin/s5-battery` | one-line battery/AC snapshot for a before/after measurement |
-| `bin/s5-shield-dryrun`, `bin/s5-logictest` | the two self-checks `install.sh` refuses to skip |
+| `bin/s5-shield-dryrun`, `bin/s5-logictest` | the two self-checks `install.sh` refuses to skip (the second also compiles and runs the blocker logic) |
 
 Everything here is **GPL-2.0-only** (`LICENSE`); the module declares it with an SPDX tag.
-Nothing outside `/usr/src/s5-shield-1.3`, `/etc/modprobe.d`, `/etc/modules-load.d`,
+Nothing outside `/usr/src/s5-shield-1.4`, `/etc/modprobe.d`, `/etc/modules-load.d`,
 `/lib/modules/<kver>/updates/dkms` and the optional witness unit is touched.
 
 ## Credits

@@ -4,7 +4,7 @@
 #     sudo /mnt/Shared/Development/Project/Others/s5-shield/install.sh
 #
 # It does exactly seven things, and nothing else:
-#   1. copies the module source to /usr/src/s5-shield-1.3
+#   1. copies the module source to /usr/src/s5-shield-1.4
 #   2. runs the source/hardware self-check first and refuses to continue if the
 #      module would not accept this machine's devices (revision 1.0 shipped
 #      exactly that bug)
@@ -27,7 +27,7 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG=s5-shield
-VER=1.3
+VER=1.4
 TARGET=/usr/src/${PKG}-${VER}
 BOOT_BEFORE="$(mktemp -t s5-shield-boot-before.XXXXXX)"
 trap 'rm -f "$BOOT_BEFORE"' EXIT
@@ -47,6 +47,16 @@ echo "=== 1. source -> $TARGET ==="
 install -d -m755 "$TARGET"
 install -m644 "$SRC_DIR/src/s5_shield.c" "$SRC_DIR/src/Makefile" "$SRC_DIR/src/dkms.conf" "$TARGET/"
 ls -la "$TARGET"
+
+# Keep exactly one source tree for this package: an older /usr/src/s5-shield-*
+# left behind is what bin/s5-shield-status would compare against (it reads the
+# newest one), so it is removed here rather than left to confuse that check.
+for d in /usr/src/"$PKG"-*; do
+	[ -d "$d" ] || continue
+	[ "$d" = "$TARGET" ] && continue
+	rm -rf "$d"
+	echo "  removed stale $d"
+done
 
 echo
 echo "=== 1b. source/hardware self-check ==="
