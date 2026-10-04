@@ -11,7 +11,7 @@ set -u
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 
-LOG=/var/log/s5-shield-witness.log
+LOG=${S5_WITNESS_LOG:-/var/log/s5-shield-witness.log}
 GPU=0000:01:00.0
 PORT=0000:00:01.1
 
@@ -60,8 +60,14 @@ now_e=$(awk -v n="$(cat "$bat/energy_now")" 'BEGIN{printf "%.3f", n/1e6}')
 printf '  energy now  : %s Wh\n' "$now_e"
 
 t_off=$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*=== \([0-9T:+-]*\) shutdown witness ===/\1/p' | tail -1)
-e_off=$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*battery: \([0-9.]*\) Wh.*/\1/p' | tail -1)
-ac_off=$(printf '%s\n' "$block" | sed -n 's/^[[:space:]]*ac_online: //p' | tail -1)
+# ...and ONLY out of the shutdown half of the block. $block runs to the end of
+# the log, so a plain `tail -1` here picked up the *boot* record's battery and
+# charger state instead: the off window then compared the boot record with
+# itself and every poweroff came out "0.00 W, CLEAN". Found by the fixtures in
+# bin/s5-evidence --selftest, which is the reason that tool exists.
+shutpart=$(printf '%s\n' "$block" | sed -n '1,/^=== .* boot witness ===/p')
+e_off=$(printf '%s\n' "$shutpart" | sed -n 's/^[[:space:]]*battery: \([0-9.]*\) Wh.*/\1/p' | tail -1)
+ac_off=$(printf '%s\n' "$shutpart" | sed -n 's/^[[:space:]]*ac_online: //p' | tail -1)
 
 if [ -z "${e_off:-}" ] || [ -z "${t_off:-}" ]; then
 	echo "  cannot compute: the witness record has no battery/timestamp line"
@@ -159,7 +165,7 @@ if [ -n "${gpu_w:-}" ]; then
 		D3cold:D3*)	echo "  reading     : the witness saw the rail released; the off draw above is the answer" ;;
 		D3cold:D0|D3hot:D0)
 				echo "  reading     : the GPU was asleep but its root port was NOT - the rail could not drop; README: Reading the console" ;;
-		D0:*)		echo "  reading     : the witness stopped watching while the dGPU was still awake. That is expected on this machine: it does not suspend on its own, s5_shield nudges it (pm_request_idle) a moment later in the poweroff notifier. The console lines show what it reached there, and the off draw above is the answer." ;;
+		D0:*)		echo "  reading     : the witness stopped watching while the dGPU was still awake. That is expected on this machine: it does not suspend on its own, and revision 1.4 does not wait for it either - the drivers' shutdown callbacks release it later, inside device_shutdown(). The console FINAL lines show what it reached there, and the off draw above is the answer." ;;
 		*)		echo "  reading     : unexpected combination - read the witness block above" ;;
 	esac
 fi

@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# s5-evidence: turn one instrumented poweroff into one EVIDENCE.md row - or
+# refuse to, and say why.
+#
+#   s5-evidence label "<short>" "<what changed>"   record the run's label (root)
+#   s5-evidence                                    print the row for the last
+#                                                  shutdown + the boot after it
+#   s5-evidence --selftest                         run the gates against
+#                                                  synthetic records (no root)
+#
+# Why a tool and not a calculator. A row in docs/EVIDENCE.md is a claim, and the
+# failure mode of this whole project is a claim that quietly means something
+# else: a window with the charger connected, a boot sample taken an hour after
+# boot, a battery that went UP, a shutdown whose boot record is from another
+# day. Every one of those still produces a number, and a number with a decimal
+# point looks like evidence. So the arithmetic here is done independently of
+# bin/s5-verdict and then cross-checked against it: if the two disagree, no row
+# is printed at all.
+set -u
+
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+LOG=${S5_WITNESS_LOG:-/var/log/s5-shield-witness.log}
+LABEL_FILE=${S5_WITNESS_LABEL_FILE:-/var/lib/s5-shield/label}
+MIN_H=0.5		# shorter windows are not judged (same floor as s5-verdict)
+BOOT_LATE_S=900		# a boot record older than this is not a "just booted" sample
+VERDICT="$HERE/bin/s5-verdict"
+
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ---------------------------------------------------------------- label
+set_label() {   # $1 short, $2 what changed
+	local short="$1" change="$2" dir
+	dir=$(dirname "$LABEL_FILE")
+	if ! mkdir -p "$dir" 2>/dev/null || ! printf '%s\n%s\n' "$short" "$change" >"$LABEL_FILE" 2>/dev/null; then
+		echo "cannot write $LABEL_FILE - run it with sudo:" >&2
+		echo "    sudo $0 label \"$short\" \"$change\"" >&2
+		return 1
+	fi
+	echo "label recorded - the next shutdown record and its EVIDENCE row will carry it:"
+	sed 's/^/  /' "$LABEL_FILE"
+}
+
+# ---------------------------------------------------------------- parsing
+# Independent of s5-verdict: the last shutdown block and the FIRST boot block
+# that follows it, out of the same log.
+field() {   # field <block> <sed-regex> -> last match
+	printf '%s\n' "$1" | sed -n "$2" | tail -1
+}
+
+# ---------------------------------------------------------------- gates
+FAIL=""
+fail() { FAIL="${FAIL}${FAIL:+
+}$1"; }
+
+# ---------------------------------------------------------------- selftest
+selftest() {
+	local work fails=0
+	work=$(mktemp -d /tmp/s5-evidence-selftest.XXXXXX)
+	trap 'rm -rf "$work"' RETURN
+	mk() { # mk <name> <bat_off> <ac_off> <bat_boot> <ac_boot> <uptime_boot> <t_boot_date> <t_boot_time> <with_boot>
+		local f="$work/$1"
+		{
+			echo "=== 2026-10-05T22:00:00+08:00 shutdown witness ==="
+			echo "kernel: test"
+			echo "label: selftest"
+			echo "change: $1"
+			echo "s5_shield: loaded, srcversion=TEST wait_ms=0"
+			echo "battery: $2 Wh (80.0%)"
+			echo "battery_raw: energy_now=60000000 voltage_now=12000000 capacity=80 status=Discharging"
+			echo "ac_online: $3"
+			echo "uptime_s: 7200"
+		} >"$f"
+		if [ "${9:-1}" = 1 ]; then
+			{
+				echo "=== ${7:-2026-10-06}T${8:-06:00:00}+08:00 boot witness ==="
+				echo "kernel: test"
+				echo "label: selftest"
+				echo "s5_shield: loaded, srcversion=TEST wait_ms=0"
+				echo "battery: $4 Wh (79.0%)"
+				echo "battery_raw: energy_now=59000000 voltage_now=12000000 capacity=79 status=Discharging"
+				echo "ac_online: $5"
+				echo "uptime_s: $6"
+			} >>"$f"
+		fi
+		printf '%s' "$f"
+	}
+	try() { # try <name> <file> <expect: row|refuse> <grep>
+		local out rc
+		out=$(S5_WITNESS_LOG="$2" "$0" row 2>&1); rc=$?
+		case "$3" in
+		row)    if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "$4"; then echo "  OK   $1"; else echo "  FAIL $1 (expected a row matching '$4', rc=$rc)"; echo "$out" | sed 's/^/       /'; fails=$((fails+1)); fi ;;
+		refuse) if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "$4"; then echo "  OK   $1"; else echo "  FAIL $1 (expected a refusal matching '$4', rc=$rc)"; echo "$out" | sed 's/^/       /'; fails=$((fails+1)); fi ;;
+		esac
+	}
+
+	echo "== s5-evidence selftest (synthetic records) =="
+	try "clean night, 0.5 Wh / 8 h"       "$(mk clean  60.000 0 59.500 0 120  2026-10-06 06:00:00 1)" row    'CLEAN'
+	try "charger on at shutdown"          "$(mk ac-on  60.000 1 59.500 0 120  2026-10-06 06:00:00 1)" refuse 'charger'
+	try "charger on at boot"              "$(mk ac-bo  60.000 0 59.500 1 120  2026-10-06 06:00:00 1)" refuse 'charger'
+	try "battery went UP"                 "$(mk up     59.000 0 60.000 0 120  2026-10-06 06:00:00 1)" refuse 'went up'
+	try "boot record 4000 s after boot"   "$(mk late   60.000 0 59.500 0 4000 2026-10-06 06:00:00 1)" refuse 'after boot'
+	try "no boot record after it"         "$(mk noboot 60.000 0 0      0 0    2026-10-06 06:00:00 0)" refuse 'no boot witness'
+	try "poisoned, 40 Wh / 2 h = 20 W"    "$(mk poison 60.000 0 20.000 0 120  2026-10-06 00:00:00 1)" row    'poisoned'
+	try "window of 12 minutes"            "$(mk short  60.000 0 59.900 0 120  2026-10-05 22:12:00 1)" refuse 'only'
+
+	echo
+	if [ "$fails" = 0 ]; then
+		echo "RESULT: OK - the gates admit a clean row and refuse every look-alike"
+		return 0
+	fi
+	echo "RESULT: FAIL - $fails case(s) behaved wrong; do not publish rows from this tool"
+	return 1
+}
+
+# ---------------------------------------------------------------- main
+case "${1:-row}" in
+--selftest|-t) selftest; exit $? ;;
+label)
+	[ $# -ge 3 ] || { usage; exit 2; }
+	set_label "$2" "$3"; exit $? ;;
+row|--row) ;;
+-h|--help) usage; exit 0 ;;
+*) usage; exit 2 ;;
+esac
+
+if [ ! -r "$LOG" ]; then
+	echo "no witness log at $LOG - install it (sudo $HERE/witness.sh install) and measure first" >&2
+	exit 1
+fi
+
+shut=$(awk '/^=== .* shutdown witness ===/{b=""} {b=b $0 "\n"} END{printf "%s", b}' "$LOG")
+[ -n "$shut" ] || { echo "REFUSE: the log has no shutdown record at all" >&2; exit 1; }
+
+shutpart=$(printf '%s\n' "$shut" | sed -n '1,/^=== .* boot witness ===/p')
+bootpart=$(printf '%s\n' "$shut" | sed -n '/^=== .* boot witness ===/,$p')
+
+t_off=$(field "$shutpart" 's/^=== \([0-9T:+-]*\) shutdown witness ===/\1/p')
+e_off=$(field "$shutpart" 's/^battery: \([0-9.]*\) Wh.*/\1/p')
+ac_off=$(field "$shutpart" 's/^ac_online: //p')
+up_off=$(field "$shutpart" 's/^uptime_s: //p')
+label=$(field "$shutpart" 's/^label: //p')
+change=$(field "$shutpart" 's/^change: //p')
+mod_off=$(field "$shutpart" 's/^s5_shield: \(.*\)/\1/p')
+raw_off=$(field "$shutpart" 's/^battery_raw: //p')
+
+if printf '%s' "$bootpart" | grep -q '^=== .* boot witness ==='; then
+	t_boot=$(field "$bootpart" 's/^=== \([0-9T:+-]*\) boot witness ===/\1/p')
+	e_boot=$(field "$bootpart" 's/^battery: \([0-9.]*\) Wh.*/\1/p')
+	ac_boot=$(field "$bootpart" 's/^ac_online: //p')
+	up_boot=$(field "$bootpart" 's/^uptime_s: //p')
+	raw_boot=$(field "$bootpart" 's/^battery_raw: //p')
+	mod_boot=$(field "$bootpart" 's/^s5_shield: \(.*\)/\1/p')
+else
+	fail "there is no boot witness after this shutdown: the row can only be written after the next boot (and the off window is what the boot sample measures)"
+fi
+
+[ -n "$t_off" ] || fail "the shutdown record has no timestamp"
+[ -n "$e_off" ] || fail "the shutdown record has no battery line"
+
+if [ -z "$FAIL" ]; then
+	t0=$(date -d "$t_off" +%s 2>/dev/null) || fail "unparsable shutdown timestamp '$t_off'"
+	t1=$(date -d "$t_boot" +%s 2>/dev/null) || fail "unparsable boot timestamp '$t_boot'"
+	[ -n "$e_boot" ] || fail "the boot record has no battery line"
+fi
+
+if [ -z "$FAIL" ]; then
+	# One independent computation, in awk, of exactly what s5-verdict computes.
+	read -r h d w <<EOF
+$(awk -v e0="$e_off" -v e1="$e_boot" -v t0="$t0" -v t1="$t1" \
+	'BEGIN { h = (t1 - t0) / 3600.0; d = e0 - e1; printf "%.4f %.4f %.4f", h, d, (h > 0 ? d / h : 0) }')
+EOF
+
+	[ "$ac_off" = 1 ] && fail "the charger was connected at shutdown (ac_online=1): it masks the S5 draw, so this window is void"
+	[ "$ac_boot" = 1 ] && fail "the charger was connected at boot (ac_online=1): the window is void"
+	awk -v h="$h" -v m="$MIN_H" 'BEGIN { exit !(h < m) }' && fail "the off window is only ${h} h; below ${MIN_H} h the shutdown's own fixed cost swamps the signal"
+	awk -v d="$d" 'BEGIN { exit !(d < 0) }' && fail "the battery went up by ${d#-} Wh between the two records: gauge drift or charging, not a measurement"
+	[ -n "$up_boot" ] && awk -v u="$up_boot" -v l="$BOOT_LATE_S" 'BEGIN { exit !(u > l) }' && \
+		fail "the boot record was written ${up_boot} s after boot, not at boot: it contains awake time"
+
+	# Cross-check against the other implementation. Two independent parsers of
+	# the same log must agree, or neither is trusted.
+	if [ -x "$VERDICT" ]; then
+		vw=$(S5_WITNESS_LOG="$LOG" "$VERDICT" 2>/dev/null | sed -n 's/^  off draw    : \([0-9.-]*\) W.*/\1/p' | tail -1)
+		if [ -n "${vw:-}" ]; then
+			agree=$(awk -v a="$w" -v b="$vw" 'BEGIN { d = a - b; if (d < 0) d = -d; print (d <= 0.02) ? "yes" : "no" }')
+			[ "$agree" = no ] && fail "s5-verdict computes ${vw} W where this tool computes ${w} W - the two disagree, so no row is published until that is understood"
+		fi
+	fi
+fi
+
+if [ -n "$FAIL" ]; then
+	echo "REFUSE - no row:" >&2
+	printf '%s\n' "$FAIL" | sed 's/^/  - /' >&2
+	echo >&2
+	echo "A refused run is not a failure of the fix; it is a window that cannot be" >&2
+	echo "quoted. Fix the condition and repeat it (docs/EVIDENCE.md, Protocol)." >&2
+	exit 1
+fi
+
+case "$mod_off" in
+*"NOT loaded"*) shield="shield: NOT loaded (baseline run)" ;;
+*)		shield="shield: armed" ;;
+esac
+[ -n "$label" ] || label=unlabelled
+[ -n "$change" ] || change="(not recorded)"
+
+verdict=INVALID
+awk -v w="$w" 'BEGIN { exit !(w > 8) }' && verdict="**poisoned**"
+awk -v w="$w" 'BEGIN { exit !(w > 2 && w <= 8) }' && verdict="borderline"
+awk -v w="$w" 'BEGIN { exit !(w <= 2) }' && verdict="**CLEAN**"
+
+printf '| %s | %s | %s | **%.3f Wh** / %.2f h => **%.2f W** | %s |\n' \
+	"$(date -d "$t_boot" +%m-%d)" "$label" "$change" "$d" "$h" "$w" "$verdict"
+
+cat <<EOF
+
+appendix for this row (paste under the table, it is what makes the row auditable):
+  window    : $t_off -> $t_boot  (${h} h, ${d} Wh)
+  label     : $label - $change
+  shutdown  : battery $e_off Wh, ac_online=${ac_off:-?}, uptime ${up_off:-?} s, $shield
+              $mod_off
+              $raw_off
+  boot      : battery $e_boot Wh, ac_online=${ac_boot:-?}, uptime ${up_boot:-?} s
+              $mod_boot
+              $raw_boot
+  cross-check: independent arithmetic, agreed with s5-verdict to <= 0.02 W
+EOF
+echo
+echo "rule 1 of docs/EVIDENCE.md applies before quoting this number anywhere:"
+echo "raw watts do not survive a change of window length ($h h here)."

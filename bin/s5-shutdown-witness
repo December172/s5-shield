@@ -43,6 +43,8 @@ MODE=${1:-shutdown}
 # Overridable for testing (the unit always uses the real paths).
 LOG=${S5_WITNESS_LOG:-/var/log/s5-shield-witness.log}
 MARKER=${S5_WITNESS_MARKER:-/var/lib/s5-shield/check-failed}
+LABEL_FILE=${S5_WITNESS_LABEL_FILE:-/var/lib/s5-shield/label}
+ROWS_FILE=${S5_WITNESS_ROWS:-/var/lib/s5-shield/rows.tsv}
 UMBRAL_W=${S5_WITNESS_UMBRAL_W:-4}	# off-window watts above which the check shouts
 LOG_MAX=${S5_WITNESS_LOG_MAX:-262144}	# trim the log above this size, keep the tail
 WAIT=${S5_WITNESS_WAIT:-6}	# seconds to watch the dGPU settle
@@ -110,6 +112,48 @@ ac_line() {
 		[ -r "$a/online" ] || continue
 		echo "ac_online: $(cat "$a/online")"
 	done
+}
+
+# The raw registers, so every published watt can be recomputed from the log
+# alone instead of being taken on trust - and so a row here can be compared
+# with upstream's `charge_now x voltage_now` method, which is the same source
+# this machine's battery exposes. Only fields that exist are printed.
+battery_raw_line() {
+	local b f out
+	for b in /sys/class/power_supply/BAT*; do
+		[ -d "$b" ] || continue
+		out=""
+		for f in energy_now charge_now voltage_now energy_full charge_full capacity status; do
+			[ -r "$b/$f" ] || continue
+			out="$out $f=$(cat "$b/$f" 2>/dev/null)"
+		done
+		if [ -n "$out" ]; then
+			echo "battery_raw:$out"
+			return 0
+		fi
+	done
+	return 0
+}
+
+# What was changed for this run, recorded at run time rather than recalled
+# afterwards: bin/s5-evidence writes the file, both records quote it, and the
+# EVIDENCE.md row is generated from it. A measurement whose "what changed"
+# column is reconstructed from memory is not evidence.
+label_file() {
+	local short change
+	short=${S5_WITNESS_LABEL:-}
+	change=${S5_WITNESS_CHANGE:-}
+	if [ -z "$short" ] && [ -r "$LABEL_FILE" ]; then
+		short=$(sed -n 1p "$LABEL_FILE" 2>/dev/null || true)
+		change=$(sed -n 2p "$LABEL_FILE" 2>/dev/null || true)
+	fi
+	echo "label: ${short:-unlabelled}"
+	[ -n "$change" ] && echo "change: $change"
+	return 0
+}
+
+uptime_line() {
+	awk '{ printf "uptime_s: %d\n", $1 }' /proc/uptime 2>/dev/null || true
 }
 
 # Processes still holding the dGPU open. readlink() only - opening the device
@@ -199,15 +243,39 @@ check_backward() {
 				exit 0
 			}
 			w = d / h;
+			# Machine-readable copy for the permanent ledger below. The log
+			# itself is capped, and the record of a good measurement must not
+			# be trimmed away before it is published.
+			printf "ROWS\t%.4f\t%.4f\t%.2f\t%s\n", h, d, w, (w > u ? "FAIL" : "OK");
 			if (w > u)
 				printf "FAIL - BACKWARD: the last poweroff drew %.2f W over %.2f h: the rail was NOT cut\n", w, h;
 			else
 				printf "OK - BACKWARD: last poweroff drew %.2f W over %.2f h (the boot itself is inside that)\n", w, h;
 		}')
+	rows=$(printf '%s\n' "$line" | sed -n 's/^ROWS\t//p')
+	line=$(printf '%s\n' "$line" | sed '/^ROWS\t/d')
 	case "$line" in
 	FAIL*)	chk_bad "${line#FAIL - }" ;;
 	*)	chk_note "$line" ;;
 	esac
+
+	# The ledger: one TSV line per judgeable window, appended and never trimmed.
+	# Written only when the numbers were valid enough to judge (charger off, a
+	# real window) and only as root, i.e. from the unit - a hand-run of this
+	# script for testing must not fabricate evidence.
+	if [ -n "${rows:-}" ] && [ "$(id -u)" = 0 ]; then
+		short=${S5_WITNESS_LABEL:-}
+		[ -z "$short" ] && [ -r "$LABEL_FILE" ] && short=$(sed -n 1p "$LABEL_FILE" 2>/dev/null || true)
+		mkdir -p "$(dirname "$ROWS_FILE")" 2>/dev/null || true
+		{
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$(date -Is)" "$t_off" "$rows" \
+				"${short:-unlabelled}" "$(uname -r)" \
+				"$(cat /sys/module/s5_shield/parameters/wait_ms 2>/dev/null || echo 'shield-not-loaded')" \
+				"$(cat /sys/module/s5_shield/srcversion 2>/dev/null || echo '-')" \
+				"$(ac_line | tr '\n' ' ')"
+		} >>"$ROWS_FILE" 2>/dev/null || true
+	fi
 }
 
 if [ "$MODE" = "boot" ]; then
@@ -228,6 +296,7 @@ if [ "$MODE" = "boot" ]; then
 		{
 			echo "=== $(date -Is) boot witness ==="
 			echo "kernel: $(uname -r)"
+			label_file
 			if lsmod | grep -qw s5_shield; then
 				echo "s5_shield: loaded, srcversion=$(cat /sys/module/s5_shield/srcversion 2>/dev/null) wait_ms=$(cat /sys/module/s5_shield/parameters/wait_ms 2>/dev/null)"
 			else
@@ -239,7 +308,9 @@ if [ "$MODE" = "boot" ]; then
 			done
 			echo "holders:$(holders)"
 			battery_line
+			battery_raw_line
 			ac_line
+			uptime_line
 		} 2>&1
 	)
 else
@@ -247,6 +318,7 @@ else
 		{
 			echo "=== $(date -Is) shutdown witness ==="
 			echo "kernel: $(uname -r)"
+			label_file
 			if lsmod | grep -qw s5_shield; then
 				echo "s5_shield: loaded, srcversion=$(cat /sys/module/s5_shield/srcversion 2>/dev/null) devs=$(cat /sys/module/s5_shield/parameters/devs 2>/dev/null) wait_ms=$(cat /sys/module/s5_shield/parameters/wait_ms 2>/dev/null)"
 			else
@@ -286,9 +358,9 @@ else
 				# this record ends. Watch the kernel console lines for what it
 				# reached there; the next boot's record settles the outcome.
 				echo "settled: dGPU still $(state_of "$GPU") after ${elapsed} ms - it does not suspend on its own."
-				echo "         s5_shield nudges it (pm_request_idle) in the poweroff notifier just after this"
-				echo "         record ends; the kernel console lines show whether it reached D3cold there,"
-				echo "         and the battery record in the next boot witness settles it either way."
+				echo "         revision 1.4 does not wait for it either (wait_ms=0): the drivers' shutdown"
+				echo "         callbacks release it later, inside device_shutdown(). The console FINAL lines"
+				echo "         show the state it reached there; the next boot's record settles the cost."
 			fi
 			echo "holders at exit:$(holders)"
 
@@ -308,7 +380,9 @@ else
 				fi
 			done
 			battery_line
+			battery_raw_line
 			ac_line
+			uptime_line
 		} 2>&1
 	)
 fi

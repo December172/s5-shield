@@ -129,6 +129,7 @@ nothing else:
 # 2. sudo systemctl poweroff        (a real poweroff, not a reboot)
 # 3. wait 30-60 min, power on, then:
 /mnt/Shared/Development/Project/Others/s5-shield/bin/s5-verdict          # watts across the OFF window
+/mnt/Shared/Development/Project/Others/s5-shield/bin/s5-evidence         # the same numbers as an EVIDENCE.md row, or the reason it refuses
 cat /var/log/s5-shield-witness.log        # what state the dGPU was in, and when
 ```
 
@@ -281,6 +282,8 @@ them. The witness unit had a fourth such bug: with `DefaultDependencies=no` and 
 | `systemd/s5-shutdown-witness.service` | the witness unit (boot record + shutdown record) |
 | `bin/s5-shutdown-witness` | the witness itself: boot self-check + shutdown timeline, reads sysfs only |
 | `bin/s5-verdict` | pairs the shutdown and boot records, prints the watts across the off window |
+| `bin/s5-evidence` | turns one poweroff into one `docs/EVIDENCE.md` row, or refuses with the reason; `--selftest` runs its gates on synthetic records |
+| `docs/EVIDENCE.md` | every measured window with its protocol, its gates and what is *not* measured |
 | `bin/s5-shield-status` | module loaded? installed source this revision? self-check result, device states |
 | `bin/s5-battery` | one-line battery/AC snapshot for a before/after measurement |
 | `bin/s5-shield-dryrun`, `bin/s5-logictest` | the two self-checks `install.sh` refuses to skip (the second also compiles and runs the blocker logic) |
