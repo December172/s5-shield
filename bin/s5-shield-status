@@ -67,6 +67,10 @@ elif [ -f "$work_src" ]; then
 fi
 if lsmod | grep -qw s5_shield; then
 	echo "  loaded  : yes (srcversion $(cat /sys/module/s5_shield/srcversion 2>/dev/null))"
+	# The ready line carries what the module found at load time, including
+	# whether the FINAL observer registered (the measurement of revision 1.4).
+	ready=$(journalctl -b 0 -k --no-pager 2>/dev/null | grep -m1 's5-shield: ready:' | sed 's/.*s5-shield: //')
+	[ -n "$ready" ] && printf '  ready   : %s\n' "$ready"
 	printf '  devs    : %s\n' "$(cat /sys/module/s5_shield/parameters/devs 2>/dev/null)"
 	printf '  noshut  : %s\n' "$(cat /sys/module/s5_shield/parameters/noshut 2>/dev/null)"
 	# wait_ms only exists from revision 1.3 on; its absence means the module in
