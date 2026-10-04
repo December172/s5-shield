@@ -225,6 +225,23 @@ appendix for this row (paste under the table, it is what makes the row auditable
               $raw_boot
   cross-check: independent arithmetic, agreed with s5-verdict to <= 0.02 W
 EOF
+
+# LA BATERIA QUE SE AGOTA NO ES UNA TASA. En una linea base (~20 W) la bateria de
+# esta maquina da para unas 3-4 h: si la ventana dura mas, el EC corta al final y
+# ese tramo no consume a ese ritmo, asi que los vatios salen ALTOS pero son un
+# suelo, no lo que gastaria indefinidamente. Se calcula la magnitud y se dice,
+# en vez de dar por bueno el numero (regla 31 de la casa).
+pct_boot=$(field "$bootpart" 's/^battery: [0-9.]* Wh (\([0-9.]*\)%).*/\1/p')
+if [ -n "$pct_boot" ] && awk -v p="$pct_boot" 'BEGIN { exit !(p <= 10) }'; then
+	cat <<EOF
+
+AVISO - la bateria estaba al ${pct_boot}% al arrancar. Con este consumo la maquina se queda
+sin bateria en unas horas (78 Wh a ~20 W = ~3,9 h), asi que si la ventana duro mas, el tramo
+final NO consumio a ese ritmo: los vatios de arriba son un SUELO, no una tasa constante. Para
+una fila comparable, carga al 100% y mide lo que la bateria aguanta; la fila con la que se
+compare tiene que durar lo mismo.
+EOF
+fi
 echo
 echo "rule 1 of docs/EVIDENCE.md applies before quoting this number anywhere:"
 echo "raw watts do not survive a change of window length ($h h here)."
