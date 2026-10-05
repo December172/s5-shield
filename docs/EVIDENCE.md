@@ -8,7 +8,9 @@ first seconds after the next boot, and it is never quoted without its window len
 
 Machine for every row below: HP OMEN 16-ap0xxx (`8E35`), BIOS F.13, Ryzen 9 8945HX + RTX 5060 Max-Q,
 Arch Linux, kernel 7.2.8-arch1-2, `systemd-boot`, Secure Boot on. The module revision is part of the
-row: the fix changed between 1.3 and 1.4 (the wait retired — see README *The fix*).
+row, and so is `wait_ms`: 1.3 shipped 5000, 1.4 shipped 0, **1.5 ships 20000**, and the difference
+between 0 and non-zero is the difference between 18.51 W and 0.43 W on this machine (see
+*Diagnostics* and README *The fix*).
 
 ## How to read these numbers
 
@@ -16,8 +18,10 @@ row: the fix changed between 1.3 and 1.4 (the wait retired — see README *The f
    window contains a fixed cost E₀ — the power-on, the boot, and the first minutes of a machine that
    draws 24–78 W awake — so a short window always reads higher than a long one for the same S5.
    Quote **Wh and the window**; derive W from those two only against windows of comparable length.
-   This machine's E₀ is **not yet pinned**, which is why the rows below are short windows and are
-   labelled as such.
+   This machine's E₀ is **not yet pinned**, which is why every row states its window. The one legal
+   pair under rule 1 is still owed: `baseline-no-shield` (2.52 h, no shield) against a clean window
+   of the *same* length with 1.5. The 11.12 h row below is a stronger result but a different window,
+   so it may not be subtracted from the baseline.
 2. **A window with the charger connected is void, not "clean".** `bin/s5-evidence` refuses to emit a
    row for one, at either end.
 3. **Do not publish a row the tool refused.** Every failure mode here — charger on, a battery that
@@ -33,8 +37,8 @@ row: the fix changed between 1.3 and 1.4 (the wait retired — see README *The f
 
 ```bash
 # before the window
-/mnt/Shared/Development/Project/Others/s5-shield/bin/s5-evidence label "clean-night-1.4" \
-        "revision 1.4, wait_ms=0, shield armed"
+/mnt/Shared/Development/Project/Others/s5-shield/bin/s5-evidence label "clean-window-1.5" \
+        "revision 1.5, wait_ms=20000, shield armed"
 /mnt/Shared/Development/Project/Others/s5-shield/bin/s5-battery   # note it, UNPLUG the charger
 sudo systemctl poweroff        # watch the console: the FINAL lines are the last thing printed
 # after the next boot
@@ -58,22 +62,52 @@ sudo systemctl poweroff        # watch the console: the FINAL lines are the last
 |---|---|---|---|---|
 | 10-03 | `clean-50min-1.3` | revision 1.3: shield armed with the dGPU in `D0`, `wait_ms=5000` ran to its full budget and gave up | ≤1 Wh / 0.83 h ⇒ **≈1 W** (raw window 2.2 Wh, of which 1.2–2.9 Wh is the uptime inside it) | **CLEAN** — n=1. Source: README *Result*; the witness record itself was trimmed by the log cap, so its raw registers can no longer be re-read |
 | 10-03 | `ac-on-void` (23:56 → 09:38) | revision 1.3, charger connected throughout | refused by the gate (both ends) | **VOID** — quoted only to show the gate works |
-| — | `baseline-no-shield` | shield removed (`sudo modprobe -r s5_shield`), same window as `clean-night-1.4` | *to be measured* | *pending* |
-| — | `clean-night-1.4` | revision 1.4, `wait_ms=0` (the wait retired), same window as the baseline | *to be measured* | *pending* |
-| — | `wait-5000-1.4` | revision 1.4 with `wait_ms=5000` restored, screening window only | *to be measured* | *pending* — isolates the wait: same code, one parameter |
+| 10-04 | `baseline-no-shield` | shield **removed** (`sudo modprobe -r s5_shield`), charger out, 2.52 h window — this unit's own "before" | **51.242 Wh / 2.52 h ⇒ 20.33 W** | **POISONED** — deliberate: the row measures the drain with nothing shielding it, and it lands in the same 18.7–24 W class as the reference machine. Raw registers: appendix of the fork's `docs/EVIDENCE-second-unit.md`, and the untrimmed `/var/lib/s5-shield/rows.tsv` |
+| 10-04/05 | `probe-wait-20s` | revision 1.4 with `wait_ms=20000` restored — the parameter 1.5 now defaults to — charger out at both ends | **4.771 Wh / 11.12 h ⇒ 0.43 W** (the boot itself is inside that window) | **CLEAN** — n=1, ledger verdict `OK`. Raw registers in `/var/lib/s5-shield/rows.tsv` and the witness log. Not comparable to the 2.52 h baseline under rule 1 (a longer window flatters the number, and it still read 0.43 W); it *is* comparable to upstream's `nocturna-real` (0.46 W over 9.5 h) |
+| — | `clean-window-1.5` | revision 1.5, `wait_ms=20000` (the default), **the same 2.52 h window** as the baseline | *to be measured* | *pending* — the row that completes the legal pair |
+
+**The wait is not optional, and that was measured the hard way.** Revision 1.4 shipped `wait_ms=0`
+on the theory that the dGPU falls asleep later anyway, inside `device_shutdown()`. The diagnostics
+that same revision added are what disproved it — one parameter, the same module binary
+(`srcversion 5ABD41F6E01E06E371E5D2F`), the same arm-time state (dGPU `D0`, root port `D0`, audio
+`D3hot`, no holders):
+
+| `wait_ms` | window | off draw | ledger |
+|---|---|---|---|
+| `0` | 0.34 h | **18.51 W** | `FAIL` — the boot check: *the rail was NOT cut* |
+| `20000` | 11.12 h | **0.43 W** | `OK` |
+
+The mechanism is why this is a step and not a tuning knob: `__pm_runtime_disable()` takes away the
+ability to suspend, and a port cannot suspend while a device below it is awake (`-EBUSY`,
+`child_count > 0`), so an awake subtree that gets armed stays awake for the whole of S5. Revision 1.5
+therefore ships `wait_ms=20000`. Note what this does *not* contradict: upstream closed the equivalent
+patch on 2026-10-04 because *their* policy already waits up to 90 s before their module is loaded, so
+a wait inside the module adds nothing **there**. Both statements hold at once — on a machine with no
+policy layer, the wait is the only thing that can settle the subtree.
+
+## Diagnostics (not rows)
+
+Windows below the 0.5 h gate are not rows and are never quoted as if they were, but two of them
+decided something, so they are kept here (the ledger keeps them regardless — that is what it is for):
+
+| when | config | window | result | what it decided |
+|---|---|---|---|---|
+| 10-04 23:03 → 23:24 | 1.4, `wait_ms=0`, shield loaded and armed | 0.34 h | 6.288 Wh ⇒ **18.51 W**, ledger `FAIL` | arming an awake subtree with no wait leaves the rail on — this is the measurement that put the wait back in 1.5 |
+| 10-04 17:31 → 17:32 and 20:24 → 20:24 | 1.4, charger connected at both ends | 0.5 and 0.0 min | not judged; no row emitted | the charger gate and the backward check working as designed — nothing may be read from either window |
 
 ## What is *not* measured here
 
-* **This unit's pre-fix drain.** It was never measured: the ≈20 W is upstream's measurement on the
-  same model, and the ≈16.7 Wh figure in the README is arithmetic from it (20 W × 0.84 h). The
-  `baseline-no-shield` row exists to close exactly this gap, and until it exists no row here may be
-  compared against a "before" that was taken on another machine.
+* **This unit's pre-fix drain** is no longer borrowed from anywhere: the `baseline-no-shield` row
+  above is this unit's own "before" (20.33 W over 2.52 h, shield removed). What is still missing is
+  the clean window of the same length — until that row exists, the pair is not complete and no
+  before/after claim may be made from it.
 * **A busy dGPU at poweroff** — CUDA job, external display, PRIME offload. Upstream covers that case
   with a 90 s wait plus a GRUB `halt`; this machine has no fallback yet, and the shield would freeze
   such a GPU awake. No row here covers it, and none should be read as if it did.
-* **A whole night with the shield**, at the standard of upstream's `nocturna-real` (0.46 W over
-  9.5 h). That is what `clean-night-1.4` is for; the 50-minute row above is not comparable to it
-  (rule 1).
+* **A whole night after a normal day's use.** The 11.12 h row above *is* an overnight window and
+  reads 0.43 W, next to upstream's `nocturna-real` (0.46 W over 9.5 h) — but it followed an idle
+  evening, and one row is one shutdown. A night that follows a day of real work is still unmeasured,
+  as is any window longer than the ~11 h this battery can carry unshielded.
 
 ## Lessons, written down
 
@@ -87,7 +121,9 @@ sudo systemctl poweroff        # watch the console: the FINAL lines are the last
    the fixtures in `bin/s5-evidence --selftest` (case `clean night, 0.5 Wh / 8 h`) and fixed the same
    hour — before any row in this file was written. Two independent computations that must agree
    (0.02 W tolerance) is now part of publishing a row.
-3. **A diagnostic that only prints is worth more than one that guesses.** Revision 1.3 waited 5 s per
-   poweroff for a state change it could not cause; revision 1.4 prints the reason the device is awake
-   (`use=`, `child=`, `dis=`) at arming time and the state it ended in (`FINAL`, after
-   `device_shutdown()`) — which is what the pending rows are read through.
+3. **A diagnostic that only prints is worth more than one that guesses — and it will eventually
+   contradict you.** Revision 1.4 replaced the wait with two read-only diagnostics, on the theory that
+   the device walk releases the dGPU anyway. Printing the blocking reason at arming time and the state
+   at the moment of no return is what let the very next measured poweroff show the theory was wrong
+   (18.51 W with no wait against 0.43 W with it), instead of leaving two plausible stories and no way
+   to choose. A measurement that cannot embarrass its author is not measuring anything.

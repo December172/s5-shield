@@ -78,9 +78,11 @@ if lsmod | grep -qw s5_shield; then
 	if [ -r /sys/module/s5_shield/parameters/wait_ms ]; then
 		wm=$(cat /sys/module/s5_shield/parameters/wait_ms)
 		if [ "$wm" = 0 ]; then
-			printf '  wait_ms : 0  (revision 1.4 default: no wait; the FINAL line reports what the device walk did)\n'
+			printf '  wait_ms : 0  (NOT the default and not safe here: arming an awake subtree with no wait left the rail on, 18.51 W measured. Re-run install.sh, or set 20000)\n'
+		elif [ "$wm" = 20000 ]; then
+			printf '  wait_ms : 20000  (the default, and the configuration measured clean: 0.43 W over 11.12 h)\n'
 		else
-			printf '  wait_ms : %s  (the revision 1.3 experiment; it timed out on this laptop and only delays the poweroff)\n' "$wm"
+			printf '  wait_ms : %s  (non-default; the wait returns as soon as the subtree settles, so a longer budget only costs shutdown time in the case that cannot settle)\n' "$wm"
 		fi
 	else
 		printf '  wait_ms : ABSENT - the loaded module predates revision 1.3: re-run install.sh\n'

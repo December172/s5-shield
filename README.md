@@ -5,7 +5,7 @@ Machine: **HP OMEN Gaming Laptop 16-ap0xxx** (`8E35`), BIOS **F.13**, AMD Ryzen 
 kernel **7.2.8-arch1-2**, ACPI S-states `S0 S4 S5`.
 
 Status: **installed and measured working** on this machine — see *Result*. The repository packages
-the module as DKMS `s5-shield/1.4`; the machine's registration moves to it the next time
+the module as DKMS `s5-shield/1.5`; the machine's registration moves to it the next time
 `install.sh` runs.
 
 ## The problem
@@ -42,15 +42,20 @@ again *after* it). A patched kernel would work but means touching signed boot im
 
 ## The fix
 
-One out-of-tree module, `s5_shield` (503 lines of code in an 883-line file that is mostly the
+One out-of-tree module, `s5_shield` (503 lines of code in a 910-line file that is mostly the
 reasoning, GPL-2.0, `src/s5_shield.c`). It registers a **reboot notifier**, which
 `kernel_power_off()` runs *before* `device_shutdown()` (`kernel/reboot.c:303-310`), so by the time
 the PCI core walks the device list it has already:
 
-0. **recorded why the dGPU is (or is not) asleep** — the runtime PM accounting (`rpm=`, `use=`,
-   `child=`, `dis=`) and, when it is awake, the blocking condition named in the runtime PM core's
-   own vocabulary (`rpm_blocker()` reads the same conditions `rpm_check_suspend_allowed()` uses:
-   `-EACCES` disabled, `-EAGAIN` a held reference, `-EBUSY` an active child);
+0. **waited for the dGPU to settle, and recorded why it is (or is not) asleep** — it asks each
+   listed device to go idle and waits up to `wait_ms` (default **20000 ms**) for the display device
+   to reach `D3cold` with its bridge out of `D0`, and prints the runtime PM accounting (`rpm=`,
+   `use=`, `child=`, `dis=`) plus, when the device is awake, the blocking condition named in the
+   runtime PM core's own vocabulary (`rpm_blocker()` reads the same conditions
+   `rpm_check_suspend_allowed()` uses: `-EACCES` disabled, `-EAGAIN` a held reference, `-EBUSY` an
+   active child). The waiting half is load-bearing and was measured to be: with the same module
+   binary, arming a subtree that is still awake with no wait left the rail on (18.51 W), and 20 s of
+   waiting cut it (0.43 W over 11 h). See *Result*;
 1. **disabled runtime PM** on the listed devices (`__pm_runtime_disable()`), so the
    `pm_runtime_resume()` above bounces with `-EACCES` instead of powering the GPU up
    (`drivers/base/power/runtime.c:798-808`);
@@ -64,34 +69,41 @@ This is the same two-halves method published for this model by Anxo Calvo (see *
 differences: it arms itself from the kernel's reboot notifier instead of from a shutdown hook, and
 it measures what it does instead of assuming it.
 
-**The wait of revision 1.3 is gone — off by default, `wait_ms=0`.** It was meant to let the dGPU
-fall asleep before the shield pinned it awake, and it cannot do that: `pm_request_idle()` only
-*asks* the runtime PM core, which refuses with `-EAGAIN` while any driver or client holds a
-reference and with `-EBUSY` while a device below is active (`rpm_check_suspend_allowed()`) — and a
-device that *can* suspend has already been idle-notified by the core when its last reference was
-dropped. When the request is accepted, `rpm_suspend(RPM_AUTO)` waits out the device's autosuspend
-delay instead of suspending at once: there is no near-instant version of this to be had from inside
-the kernel. Measured here (2026-10-03, 15:13 poweroff): the 5000 ms wait ran out with the dGPU
-still in `D0`, the module armed anyway, and the 50-minute S5 that followed still cost ~1 W. The
-saving comes from **1+2** — the kernel never resumes the GPU and `nv_pci_shutdown()` never runs.
-If `wait_ms` is set anyway, phase 1 asks every listed device to go idle once and only phase 2 spends
-the budget polling, so the result no longer depends on the order of `devs=`.
+**The wait is the mechanism, and it is on by default (`wait_ms=20000`).** Revision 1.3 added it;
+revision 1.4 retired it on the theory that the dGPU falls asleep later anyway, inside
+`device_shutdown()`. That theory was wrong, and the diagnostics 1.4 added are what proved it. Same
+module binary (`srcversion 5ABD41F6E01E06E371E5D2F`), same arm-time state (dGPU `D0`, root port
+`D0`, audio `D3hot`, no holders), one parameter:
 
-**What decides the rail is now measured, not inferred.** Everything above runs *before*
-`device_shutdown()`; the references that keep the dGPU awake are released *inside* it. So a
-`SYS_OFF_MODE_POWER_OFF_PREPARE` handler (`s5_shield_observe_final()`) prints a `FINAL` line per
-device after the walk and before the firmware poweroff — the last observable moment
-(`kernel_power_off()`: notifier + `device_shutdown()` → power-off-prepare → `syscore_shutdown()` →
-`machine_power_off()`). Read it as: dGPU `D3cold` with the bridge in `D3hot`/`D3cold` ⇒ the rail was
-released before the firmware took over, i.e. the shield worked by *not resuming* it, and the `D0`
-seen at arming time was not the deciding factor; anything still in `D0` ⇒ whatever held it awake
-(the `use=`/`child=` fields say which) was released too late or never, and *that* is the case a
-shutdown-time fallback has to cover — not a longer wait.
+| `wait_ms` | window | off draw | ledger |
+|---|---|---|---|
+| `0` (the 1.4 default) | 0.34 h | **18.51 W** | `FAIL` — the boot check: *the rail was NOT cut* |
+| `20000` (the 1.5 default) | 11.12 h | **0.43 W** | `OK` |
 
-The expensive case is still a GPU that is **busy** at poweroff — a CUDA job, an external display,
-PRIME offload — which the shield would freeze busy for ~19 W the whole night. Upstream covers that
-with a 90 s wait plus a GRUB `halt` fallback; this machine, with systemd-boot, has no such fallback
-yet.
+The reason is structural rather than a tuning artifact: arming is a one-way door.
+`__pm_runtime_disable()` takes away the machinery that would have suspended the device, and a port
+cannot suspend while a child below it is awake (`-EBUSY`, `child_count > 0`) — so an awake subtree
+that gets armed stays awake for the whole of S5. The wait can only *ask* (`pm_request_idle()`,
+refused with `-EAGAIN` while a reference is held and `-EBUSY` while a child is active; an accepted
+request then waits out the autosuspend delay), so what it buys is the case that *can* settle but has
+not been asked yet — which on this machine is the normal one. It returns the moment the subtree is
+settled, so a generous budget costs nothing when the GPU is already asleep and at most itself when
+it cannot settle at all. Phase 1 asks every listed device to go idle once; only phase 2 spends the
+budget polling, so the result no longer depends on the order of `devs=`.
+
+**What decides the rail is measured, not inferred.** The `FINAL` lines come from a
+`SYS_OFF_MODE_POWER_OFF_PREPARE` handler (`s5_shield_observe_final()`) that prints after the device
+walk and before the firmware poweroff — the last observable moment (`kernel_power_off()`: notifier +
+`device_shutdown()` → power-off-prepare → `syscore_shutdown()` → `machine_power_off()`). Read them
+as: dGPU `D3cold` with the bridge in `D3hot`/`D3cold` ⇒ the rail was released before the firmware
+took over; anything still in `D0` ⇒ the subtree was armed awake, which is what the wait exists to
+prevent and, when the wait cannot settle it either (a held reference: `use=`), the case a
+shutdown-time fallback has to cover.
+
+The expensive case that remains is a GPU that is **busy** at poweroff — a CUDA job, an external
+display, PRIME offload — because a held reference is exactly what no wait can clear, and the shield
+would then freeze that GPU awake for ~19 W the whole night. Upstream covers it with a 90 s wait plus
+a GRUB `halt` fallback; this machine, with systemd-boot, has no such fallback yet.
 
 Safety rails: nothing happens on reboot/halt or while the system runs; `devs=` is mandatory, and
 every address is resolved and class-checked (display / audio / PCI bridge only) both at load time
@@ -116,7 +128,7 @@ would not accept this machine's devices. DKMS then rebuilds it on every kernel u
 ```bash
 /mnt/Shared/Development/Project/Others/s5-shield/bin/s5-shield-status    # loaded? installed source == this revision? device states
 /mnt/Shared/Development/Project/Others/s5-shield/bin/s5-shield-dryrun    # what the module would do, read out of the C source
-dmesg | grep s5-shield                    # "ready: 3 target(s), …, wait_ms=0, FINAL observer=on"
+dmesg | grep s5-shield                    # "ready: 3 target(s), …, wait_ms=20000, FINAL observer=on"
 ```
 
 A **reboot proves nothing** (the shield acts on poweroff only), and uptime drowns the effect: this
@@ -161,9 +173,13 @@ capped at 256 KB (keeping the tail, which always contains the last shutdown reco
 grow forever — the same concern upstream solves with `logrotate`, without the extra packaging.
 
 The kernel prints its own account as the machine goes down, visible even with `quiet loglevel=3`.
-Every line below the `FINAL` marker is the module's own output; the last four come from the
-power-off-prepare observer. (`wait_ms=0` in revision 1.4, so the two wait lines of the 15:13
-transcript are gone.)
+Every line below the `FINAL` marker is the module's own output. The arming block is the one measured
+on 2026-10-04 (revision 1.4, `wait_ms=0`, which is why it says it is not waiting); revision 1.5 with
+the default wait prints the same block plus its own lines — `asking runtime PM to let go and waiting
+up to 20000 ms`, any state change it sees while polling, and then either `settled after N ms` or
+`not settled after 20000 ms … arming anyway - expect the rail to stay on`. The `FINAL` lines after
+them are the shape this revision is expected to print: the measured night (0.43 W) says the subtree
+did end up asleep, but those console lines have not been photographed yet.
 
 ```
 s5-shield: poweroff path, 3 device(s) listed
@@ -183,14 +199,13 @@ s5-shield: FINAL 0000:01:00.1 pci=D3cold acpi=D3cold driver=snd_hda_intel rpm=su
 s5-shield: FINAL 0000:00:01.1 pci=D3hot acpi=D3hot driver=pcieport rpm=suspended use=0 child=0 dis=1 auto=no parent=suspended
 ```
 
-The shape to expect on a healthy poweroff is the one above: **`D0` at arming time, `D3cold`/
-`D3hot` in the `FINAL` lines.** The `can still be warm` warnings are the module being accurate
-rather than reassuring — the dGPU and its port were awake when it armed, so all it could do was
-keep the kernel and the driver away from them, and the drop happened later, inside the device walk.
-The two `use=1`/`child=1` fields at arming time are the exact reason the wait of revision 1.3 could
-never have changed that: the root port cannot suspend while the GPU under it is active. (The
-`FINAL` values above are what this revision is expected to print; the transcript is filled in from
-the first instrumented poweroff with 1.4 and until then the arming half is the measured part.)
+The shape to expect on a healthy poweroff: **the wait settles, and the arming block that follows
+reports a subtree that is already `D3cold`/`D3hot`, with `FINAL` agreeing.** The `can still be warm`
+warnings below are the module being accurate rather than reassuring: they are what 1.4 printed when
+it armed with the dGPU awake and no wait — the configuration measured at 18.51 W. With the 1.5
+default those two lines should not appear, because the wait either settles the subtree or says out
+loud that it could not. (The `FINAL` values in this transcript are still the expected shape rather
+than a photograph: the 11-hour night proves the rail was cut, not which line said so.)
 
 ## Reading the console
 
@@ -201,8 +216,8 @@ firmware poweroff — the moment that decides the rail.
 
 | what you see | what it means | what to do |
 |---|---|---|
-| arming `state=D0 … use=1 child=0`, then `FINAL … pci=D3cold` | the dGPU was awake when the shield armed, and the device walk released it: the rail was cut before the firmware took over. This is the **healthy** case on this laptop, and it is why the wait was never the mechanism. | nothing — this is the fix working |
-| `FINAL … pci=D0` on the GPU, or the bridge still `pci=D0` | whatever held it awake (`use=` a reference, `child=` an active device below) was released too late or never, so the rail is likely still on. | find the holder from the two counters; this is the case that needs a shutdown-time fallback, not a longer wait (upstream's 90 s + GRUB `halt`; this machine has none yet) |
+| the wait reports `settled after N ms`, the arming block shows `D3cold`/`D3hot`, `FINAL` agrees | the subtree was asleep before it was armed, so nothing could wake it: the rail was cut before the firmware took over. This is the **healthy** case with the 1.5 default (0.43 W measured over 11.12 h). | nothing — this is the fix working |
+| the wait reports `not settled after 20000 ms`, and `FINAL` still shows the GPU or the bridge in `D0` | the subtree was armed awake (`use=` a held reference, `child=` an active device below): the rail is very likely still on — 18.51 W was measured exactly this way. | find the holder in the two counters; a held reference is what no wait can clear, so this is the case for a shutdown-time fallback (upstream's 90 s + GRUB `halt`; this machine has none yet) |
 | no `FINAL` line at all | the observer did not register — check the boot line `ready: … FINAL observer=on`, or that the kernel reached power-off-prepare. | nothing: the shield works without it, you only lose the measurement |
 
 The fields: `rpm=` is the device's runtime PM status, `use=` is how many references hold it awake
@@ -210,7 +225,9 @@ The fields: `rpm=` is the device's runtime PM status, `use=` is how many referen
 (`-EBUSY`; a root port with `child=1` is the normal state while its GPU is awake), `dis=` is the
 disable depth this module itself raises when it arms, `auto=` is the `power/control` setting, and
 `acpi=` is the ACPI power state of the same device — the platform-side half of "is the rail off".
-The arming-time `D0` on its own is **not** an alarm: only the `FINAL` line decides.
+A `D0` at the witness snapshot is **not** an alarm by itself: that snapshot is taken before the
+poweroff notifier, and the module's wait runs after it. A `D0` that survives both the wait and the
+device walk is the alarm — that is what the `FINAL` line is for.
 
 The `FINAL` lines are printed immediately before the firmware is asked to power off, so they are on
 screen only for as long as the S5 transition takes. To photograph them at leisure, load the module
@@ -221,36 +238,43 @@ sudo modprobe -r s5_shield && sudo modprobe s5_shield final_hold_ms=8000
 # ... now power off and photograph the screen; nothing to undo afterwards
 ```
 
-## Result (2026-10-03)
+## Result
 
-First instrumented poweroff: 11:51:04 → 12:41:07, **50 minutes off**, on battery with the charger
-unplugged the whole time. This is revision 1.3 (the 5 s wait still enabled); revision 1.4 keeps the
-same two halves and turns that wait off, so the number is expected to hold — the confirming run,
-with the `FINAL` lines, is the next poweroff.
+Three judged windows, all on battery with the charger unplugged at both ends, all with the witness
+record carrying its raw registers (`docs/EVIDENCE.md` has the table, the gates and the ledger):
 
-* The witness ran (that is itself a fix — see *History*) and recorded the dGPU **still in `D0`
-  after 6 s with no holders**: the nvidia driver does not runtime-suspend it on its own once its
-  clients are gone. The module's own 5 s wait ends the same way — a photo of the 15:13 poweroff
-  shows `still D0 after 5000 ms, giving up on the wait` — so step 0 is *not* what makes these
-  poweroffs cheap. **(a)+(b) are:** the kernel never resumes the GPU and `nv_pci_shutdown()` never
-  runs. An idle `D0` GPU is nearly free; the ~19-20 W case is a *busy* one.
-* Battery at the last moment before poweroff **64.743 Wh (82.8%)**; first sample after boot
-  **80%** — 2.2 Wh, of which the three minutes of uptime in between are worth 1.2–2.9 Wh. So the
-  50 minutes the machine was actually off cost **at most ~1 Wh (≈1 W)**. The "≈16.7 Wh the old
-  behaviour produced over the same window" is arithmetic from the published ~20 W for this model
-  (20 W × 0.84 h), not a measurement taken on this unit — this machine's pre-fix drain was never
-  measured here, only its symptom (warm chassis, flat battery).
-* Chassis cold — the symptom this started from, gone.
+| when | configuration | off window | result |
+|---|---|---|---|
+| 10-04 12:06 → 14:37 | **no shield at all** (`modprobe -r`) | 2.52 h | 51.242 Wh ⇒ **20.33 W** — this unit's own "before" |
+| 10-04 23:03 → 23:24 | 1.4, `wait_ms=0` | 0.34 h | 6.288 Wh ⇒ **18.51 W** — it armed a subtree that was awake; ledger `FAIL`, check: *the rail was NOT cut* |
+| 10-04 23:37 → 10-05 10:44 | 1.5, `wait_ms=20000` (the new default) | 11.12 h | 4.771 Wh ⇒ **0.43 W** — ledger `OK` |
+
+The middle row is what earns the other two: it is the **same module binary** as the last row
+(`srcversion 5ABD41F6E01E06E371E5D2F`) with one parameter changed, and it is what turned "the wait
+does not pay for itself" into a measured falsehood. The last row sits next to upstream's own night
+on the reference machine (0.46 W over 9.5 h) — and it is *not* comparable to the 2.52 h baseline
+under rule 1: a longer window spreads the fixed boot cost thinner, which flatters it, and it still
+read 0.43 W.
+
+* Chassis cold after the 11-hour window — the symptom this started from, gone.
+* The 2026-10-03 50-minute run (~1 W, revision 1.3, `wait_ms=5000`) was the first hint that the wait
+  was doing the work; its witness record has since been trimmed by the log cap, which is why
+  `rows.tsv` exists and why the rows above are quoted from the ledger rather than from prose.
 
 ## Limits
 
-* If the dGPU does not reach `D3cold` before the shield arms, the module says so — with the reason
-  — and that poweroff is no worse than before: the rail was never released, so there was nothing to
-  preserve. The remaining
-  lever would be `pcie_port_pm=force` on the kernel command line, which is out of scope here.
-* The wait is off (`wait_ms=0`): on this machine it cost 5 s per poweroff, timed out every time, and
-  the `FINAL` line is what now says whether the rail actually dropped. Re-enable it with
-  `wait_ms=5000` only to re-run that experiment.
+* The wait is a budget, not a guarantee. A subtree that cannot settle — a held reference (`use=`) —
+  will not settle however long the budget is, and the module then arms anyway and says so in the
+  `not settled … arming anyway` line. That poweroff is no worse than it would have been without the
+  shield; it is the case a shutdown-time fallback exists for (upstream: 90 s plus a GRUB `halt`;
+  this machine, with systemd-boot, has none yet).
+* The wait costs shutdown time exactly when it cannot help: up to `wait_ms` (20 s by default) before
+  the same arming happens. It returns the moment the subtree is settled, so a poweroff whose dGPU is
+  already asleep pays nothing at all.
+* A GPU that is **in use** at poweroff — a CUDA job, an external display, PRIME offload — holds a
+  reference, so no wait clears it: the shield freezes it awake and that S5 costs the ~19 W class.
+* If a subtree refuses to settle and there is no fallback, the remaining lever is
+  `pcie_port_pm=force` on the kernel command line, which is out of scope here.
 * The shield is not undone by `modprobe -r`: once armed, the next poweroff is committed. The worst
   case of this class of change is a hang at poweroff — hold the power button ~10 s; the
   filesystems are already unmounted at that point. It cannot hang a reboot: it only arms for
@@ -262,9 +286,11 @@ with the `FINAL` lines, is the next poweroff.
 
 Revisions 1.0 and 1.1 both shipped a module that silently refused to load its own device list (a
 wrong audio class macro, then a `class >> 16` shift against 16-bit macros) — so the fix was inert
-and nothing said so. 1.2 fixed the decoding; 1.3 added the wait (step 0); 1.4 turns that wait off
-and replaces it with measurement: the arming-time blocking reason, and a `FINAL` line at the moment
-of no return. All three bugs were caught by review, not by testing, which is why
+and nothing said so. 1.2 fixed the decoding; 1.3 added the wait (step 0); 1.4 turned that wait off
+and replaced it with measurement — the arming-time blocking reason and a `FINAL` line at the moment
+of no return — and that measurement then proved 1.4's own default wrong, which 1.5 corrects: the wait
+is back on by default, because it is the step that makes the rest of the fix reachable. All three
+bugs were caught by review, not by testing, which is why
 `bin/s5-shield-dryrun` and `bin/s5-logictest` now read the accept-list, the shift **and the
 blocker logic** out of the C source and check them against the live hardware instead of mirroring
 them. The witness unit had a fourth such bug: with `DefaultDependencies=no` and only
@@ -289,7 +315,7 @@ them. The witness unit had a fourth such bug: with `DefaultDependencies=no` and 
 | `bin/s5-shield-dryrun`, `bin/s5-logictest` | the two self-checks `install.sh` refuses to skip (the second also compiles and runs the blocker logic) |
 
 Everything here is **GPL-2.0-only** (`LICENSE`); the module declares it with an SPDX tag.
-Nothing outside `/usr/src/s5-shield-1.4`, `/etc/modprobe.d`, `/etc/modules-load.d`,
+Nothing outside `/usr/src/s5-shield-1.5`, `/etc/modprobe.d`, `/etc/modules-load.d`,
 `/lib/modules/<kver>/updates/dkms` and the optional witness unit is touched.
 
 ## Credits

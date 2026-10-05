@@ -351,16 +351,28 @@ else
 			if [ "$(state_of "$GPU")" = "D3cold" ]; then
 				echo "settled: dGPU reached D3cold after ${elapsed} ms (rail off)"
 			else
-				# This is what the 2026-10-03 11:51 record showed, and it is NOT
-				# the end of the story: the nvidia driver does not suspend the
-				# dGPU on its own once its clients are gone - s5_shield nudges it
-				# with pm_request_idle() in the poweroff notifier, a moment after
-				# this record ends. Watch the kernel console lines for what it
-				# reached there; the next boot's record settles the outcome.
+				# This snapshot is taken BEFORE the poweroff notifier runs, so
+				# "not asleep yet" here is not a verdict: s5_shield nudges the
+				# runtime PM core with pm_request_idle() and waits wait_ms a
+				# moment after this record ends. Whether it settled there is on
+				# the kernel console; whether the rail was cut is what the next
+				# boot's check line reports. The module's own parameter decides
+				# which of the two sentences below is true - a record that
+				# asserts the wrong one is worse than no record.
+				wm=$(cat /sys/module/s5_shield/parameters/wait_ms 2>/dev/null || echo '?')
 				echo "settled: dGPU still $(state_of "$GPU") after ${elapsed} ms - it does not suspend on its own."
-				echo "         revision 1.4 does not wait for it either (wait_ms=0): the drivers' shutdown"
-				echo "         callbacks release it later, inside device_shutdown(). The console FINAL lines"
-				echo "         show the state it reached there; the next boot's record settles the cost."
+				if [ "${wm:-0}" = 0 ]; then
+					echo "         wait_ms=0: the module will NOT wait for it either, and arming with the"
+					echo "         subtree awake leaves the rail on (18.51 W measured this way). The"
+					echo "         console FINAL lines show the state it reached; the next boot's record"
+					echo "         settles the cost."
+				else
+					echo "         wait_ms=${wm}: the module asks for idle and waits up to ${wm} ms for"
+					echo "         D3cold with the bridge out of D0 BEFORE it arms; an awake subtree that"
+					echo "         is armed is awake for the whole of S5 (18.51 W measured). The console"
+					echo "         FINAL lines show whether it settled; the next boot's record settles the"
+					echo "         cost."
+				fi
 			fi
 			echo "holders at exit:$(holders)"
 

@@ -23,10 +23,13 @@
  * device_shutdown() (v7.2.8: kernel/reboot.c:303-309), so by the time the PCI
  * core walks the device list:
  *
- *	(0) *optionally* (wait_ms=, default 0 = off) the module asks the listed
- *	    devices to go idle and waits for the display device to reach D3cold
- *	    with its bridge out of D0.  Off by default because it cannot do what
- *	    revision 1.3 added it for: see settle_before_arming();
+ *	(0) the module asks the listed devices to go idle and waits up to
+ *	    wait_ms (default 20000) for the display device to reach D3cold with
+ *	    its bridge out of D0.  This is not a nicety: arming takes the ability
+ *	    to suspend away, so a subtree that is still awake when (a) is applied
+ *	    stays awake for the whole of S5.  Measured with one parameter and the
+ *	    same binary: 18.51 W without the wait, 0.43 W with it.  See
+ *	    settle_before_arming();
  *	(a) runtime PM is disabled on the listed devices, so the
  *	    pm_runtime_resume() above bounces with -EACCES instead of powering
  *	    the GPU up (v7.2.8: drivers/base/power/runtime.c:796-808); and
@@ -75,9 +78,14 @@
  *	     rail stayed on for the whole of S5 - the fix would have been
  *	     silently useless in exactly the case it exists for.  The wait
  *	     nudged the runtime PM core with pm_request_idle() while it waited.
- *	     1.4 retired both, for the reasons written out in
- *	     settle_before_arming(): the nudge is refused exactly when it would
- *	     be needed, and the drop happens later, inside device_shutdown().
+ *	     1.4 rewrote that wait into phases (1: ask every listed device to go
+ *	     idle once, 2: poll a single shared budget) and turned it *off* by
+ *	     default, on the theory that the drop happens later anyway, inside
+ *	     device_shutdown().  Two read-only diagnostics were added in the same
+ *	     revision: the runtime PM accounting (and the blocking reason) at
+ *	     arming time, and a POWER_OFF_PREPARE observer that records the state
+ *	     at the moment of no return.  That observer is what disproved the
+ *	     theory - see 1.5.
  *
  *	     bin/s5-shield-dryrun now reads the shift out of pci_class16() and the
  *	     accept-list out of class_allowed(), resolves both against the
@@ -85,14 +93,14 @@
  *	     install.sh proceed if they disagree.  That guard reproduces both
  *	     1.0/1.1 bugs; a mirror that cannot disagree with the source is
  *	     worthless, which is exactly how 1.0 shipped.
- *	1.4  the wait is off by default (wait_ms=0) and no longer depends on the
- *	     order of devs=: phase 1 asks every listed device to go idle, phase 2
- *	     polls, and "settled" means the display device is D3cold *and* no
- *	     listed bridge is still in D0 (the rail is released by the port, not
- *	     by the GPU).  Two read-only diagnostics were added: the runtime PM
- *	     accounting (and the blocking reason) at arming time, and a
- *	     POWER_OFF_PREPARE observer that records the state at the moment of
- *	     no return.  Rationale and measurement in settle_before_arming().
+ *	1.5  the wait is ON by default again (wait_ms=20000).  1.4's default was
+ *	     measured to be wrong on this machine, with one parameter and the same
+ *	     module binary: arming a subtree that is still awake, with no wait,
+ *	     left the rail on (18.51 W over 0.34 h, ledger verdict FAIL, the boot
+ *	     check reporting "the rail was NOT cut"), while wait_ms=20000 cut it
+ *	     (0.43 W over 11.12 h).  Arming takes the ability to suspend away, so
+ *	     the wait is not an optimisation: it is the step that makes the rest
+ *	     of the fix reachable.  See settle_before_arming().
  *
  * WHAT IT DOES NOT DO
  *	- Nothing happens on reboot (SYS_RESTART) or halt (SYS_HALT), or at any
@@ -142,13 +150,17 @@ MODULE_PARM_DESC(noshut, "Comma separated driver names whose .shutdown callback 
  * How long the notifier waits for the listed display device (and its bridge) to
  * settle before it disables runtime PM.  See settle_before_arming().
  *
- * DEFAULT 0: do not wait.  Revision 1.3 shipped 5000 and the wait cannot do
- * what it was added for - the rationale, and the measurement behind it, are in
- * settle_before_arming().  Set it to a non-zero value only to experiment.
+ * DEFAULT 20000, and that number is a measurement rather than a taste: with the
+ * same module binary, wait_ms=0 left the rail on (18.51 W over 0.34 h) and
+ * wait_ms=20000 cut it (0.43 W over 11.12 h).  The wait returns as soon as the
+ * subtree is settled, so a generous budget costs nothing in the common case and
+ * at most itself in the case that cannot settle at all.  0 disables it, which is
+ * only correct where userspace has already waited - upstream ships a shutdown
+ * policy that waits up to 90 s before its module is even loaded.
  */
-static unsigned int wait_ms;
+static unsigned int wait_ms = 20000;
 module_param(wait_ms, uint, 0444);
-MODULE_PARM_DESC(wait_ms, "At poweroff, wait up to this many ms for the display device to settle before runtime PM is disabled (0 = do not wait, the default)");
+MODULE_PARM_DESC(wait_ms, "At poweroff, wait up to this many ms for the display device to settle before runtime PM is disabled (0 = do not wait; default 20000)");
 
 /*
  * Diagnostic knob, 0 by default.  The FINAL lines are the last thing printed
@@ -424,37 +436,52 @@ static bool is_below(struct pci_dev *child, struct pci_dev *bridge)
 }
 
 /*
- * THE STEP THAT DOES NOT PAY FOR ITSELF - AND IS THEREFORE OFF BY DEFAULT.
+ * THE STEP THAT DECIDES THE RAIL - AND WHY IT IS ON BY DEFAULT.
  *
  * Revision 1.3 waited here for D3cold, nudging the runtime PM core with
- * pm_request_idle() while it waited.  The code is kept, the default is 0, and
- * the two reasons are worth writing down because both were measured or read out
- * of the source after that revision shipped:
+ * pm_request_idle() while it waited.  Revision 1.4 turned it off, on the theory
+ * that the state that decides the rail is reached later anyway, inside
+ * device_shutdown().  That theory has now been measured, and on this machine it
+ * is wrong.
  *
- *  1. pm_request_idle() can only *ask*, and rpm_check_suspend_allowed()
- *     refuses with -EACCES (runtime PM disabled), -EAGAIN (usage_count > 0) or
- *     -EBUSY (a child is still active - the dGPU's own case for its root port,
- *     which is why the port cannot sleep while the GPU is awake).  A device
- *     that *can* suspend has already been idle-notified by the core when its
- *     driver dropped the last reference, so the nudge is a no-op there as well.
- *     And when it is accepted, rpm_suspend(RPM_AUTO) waits out the device's
- *     autosuspend delay instead of suspending on the spot.  There is no
- *     "near-instant" version of this to be had from inside the kernel.
- *  2. The state that decides the *rail* is reached later anyway: the drivers'
- *     own .shutdown callbacks run inside device_shutdown(), after this
- *     notifier, and that is where the references that keep the dGPU awake are
- *     finally released.  On this machine the wait ran its full 5000 ms with the
- *     GPU still in D0 (2026-10-03 15:13) - and the measured S5 that followed
- *     still cost ~1 W over 50 minutes.  The observer at the end of this file
- *     now records that final state instead of leaving it to inference.
+ * The measurement - same module binary (srcversion 5ABD41F6E01E06E371E5D2F), same
+ * arm-time state (dGPU D0, root port D0, audio D3hot, no holders), one
+ * parameter:
  *
- * If wait_ms is set anyway (experiment, or a machine that behaves differently):
- * phase 1 asks every listed device to go idle exactly once, and only phase 2
- * spends the budget polling.  The single loop of revision 1.3 spent a shared
- * deadline in list order, so with the devs=bridge,gpu,audio list that
- * s5-descubre-dgpu generates the bridge ate the whole budget - a port cannot
- * suspend while the GPU below it is awake - and the GPU never got a nudge at
- * all.  Nothing here imitates that bug.
+ *	wait_ms=0	0.34 h off -> 18.51 W	(ledger FAIL; the boot check:
+ *						 "the rail was NOT cut")
+ *	wait_ms=20000	11.12 h off -> 0.43 W	(ledger OK)
+ *
+ * Two reasons why that is the expected shape of the result rather than a fluke:
+ *
+ *  1. Arming takes the ability to suspend away.  __pm_runtime_disable() is a
+ *     one-way door for this poweroff: a device still in D0 when it is raised
+ *     has just lost the runtime PM machinery that would have suspended it, and
+ *     the port that releases the dGPU's rail cannot suspend while its child is
+ *     awake either (-EBUSY, child_count > 0).  An awake subtree that gets armed
+ *     is an awake subtree for the whole of S5.
+ *  2. pm_request_idle() can only *ask*, so this is a budget and not a promise:
+ *     rpm_check_suspend_allowed() refuses with -EACCES (runtime PM disabled),
+ *     -EAGAIN (usage_count > 0) or -EBUSY (a child is still active), and an
+ *     accepted request goes through rpm_suspend(RPM_AUTO), which waits out the
+ *     device's autosuspend delay.  A subtree that cannot settle will not settle
+ *     however long the budget is - and that case is what a shutdown-time policy
+ *     is for (upstream waits up to 90 s and then falls back to a bootloader
+ *     halt), not a bigger number here.
+ *
+ * So the budget buys exactly one thing: the case that CAN settle but has not
+ * been asked, or whose autosuspend delay has not expired.  That case is the
+ * normal one on a machine like this, which is why the default is 20000 and not
+ * 0. The wait returns the moment settled() is true, so it costs nothing when the
+ * subtree is already asleep, and at worst it delays a poweroff by its own budget
+ * before the same arming happens as would have happened anyway.
+ *
+ * Either way the phases are: phase 1 asks every listed device to go idle exactly
+ * once, and only phase 2 spends the budget polling.  The single loop of revision
+ * 1.3 spent a shared deadline in list order, so with the devs=bridge,gpu,audio
+ * list that s5-descubre-dgpu generates the bridge ate the whole budget - a port
+ * cannot suspend while the GPU below it is awake - and the GPU never got a nudge
+ * at all.  Nothing here imitates that bug.
  */
 static bool settled(void)
 {
@@ -491,7 +518,7 @@ static void settle_before_arming(void)
 			pci_emerg(display_target, "s5-shield: %s is already in D3cold and its bridge is out of D0 (rail off); wait_ms=0, no wait\n",
 				  pci_name(display_target));
 		else
-			pci_emerg(display_target, "s5-shield: wait_ms=0, not waiting: %s is %s, %s [%s]. Nothing here resumes it from now on; whether this poweroff is expensive is decided inside device_shutdown() and printed by the FINAL line\n",
+			pci_emerg(display_target, "s5-shield: wait_ms=0, not waiting: %s is %s, %s [%s]. Arming now takes away its ability to suspend, so this poweroff will very likely leave the rail on - 18.51 W was measured exactly this way. If that is not what you want, set wait_ms (20000 is the default) and reboot\n",
 				  pci_name(display_target), pwr_name(st),
 				  rpm_blocker(&display_target->dev), acc);
 		return;
@@ -524,7 +551,7 @@ static void settle_before_arming(void)
 	}
 
 	rpm_accounting(&display_target->dev, acc, sizeof(acc));
-	pci_emerg(display_target, "s5-shield: not settled after %u ms: %s still %s, %s [%s]; arming anyway (see README: Reading the console)\n",
+	pci_emerg(display_target, "s5-shield: not settled after %u ms: %s still %s, %s [%s]; arming anyway - expect the rail to stay on for this poweroff (18.51 W was measured this way). This is the case that needs a shutdown-time fallback, not a longer wait\n",
 		  waited, pci_name(display_target),
 		  pwr_name(display_target->current_state),
 		  rpm_blocker(&display_target->dev), acc);
@@ -878,6 +905,6 @@ module_init(s5_shield_init);
 module_exit(s5_shield_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.4");
+MODULE_VERSION("1.5");
 MODULE_DESCRIPTION("Keep the discrete GPU in D3cold during poweroff (S5 rail-off fix for HP OMEN 16-ap0xxx)");
 MODULE_AUTHOR("prepared for december172");

@@ -4,7 +4,7 @@
 #     sudo /mnt/Shared/Development/Project/Others/s5-shield/install.sh
 #
 # It does exactly seven things, and nothing else:
-#   1. copies the module source to /usr/src/s5-shield-1.4
+#   1. copies the module source to /usr/src/s5-shield-1.5
 #   2. runs the source/hardware self-check first and refuses to continue if the
 #      module would not accept this machine's devices (revision 1.0 shipped
 #      exactly that bug)
@@ -27,7 +27,7 @@ set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG=s5-shield
-VER=1.4
+VER=1.5
 TARGET=/usr/src/${PKG}-${VER}
 BOOT_BEFORE="$(mktemp -t s5-shield-boot-before.XXXXXX)"
 trap 'rm -f "$BOOT_BEFORE"' EXIT

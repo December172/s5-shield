@@ -165,7 +165,7 @@ if [ -n "${gpu_w:-}" ]; then
 		D3cold:D3*)	echo "  reading     : the witness saw the rail released; the off draw above is the answer" ;;
 		D3cold:D0|D3hot:D0)
 				echo "  reading     : the GPU was asleep but its root port was NOT - the rail could not drop; README: Reading the console" ;;
-		D0:*)		echo "  reading     : the witness stopped watching while the dGPU was still awake. That is expected on this machine: it does not suspend on its own, and revision 1.4 does not wait for it either - the drivers' shutdown callbacks release it later, inside device_shutdown(). The console FINAL lines show what it reached there, and the off draw above is the answer." ;;
+		D0:*)		echo "  reading     : the witness stopped watching while the dGPU was still awake. That snapshot is taken before the poweroff notifier, so it is not a verdict by itself: s5_shield asks for idle and waits wait_ms (20000 by default) straight after it, and whether the rail was cut is what the off draw above reports - measured with wait_ms=0: 18.51 W; with 20000: 0.43 W." ;;
 		*)		echo "  reading     : unexpected combination - read the witness block above" ;;
 	esac
 fi
