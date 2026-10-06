@@ -113,13 +113,14 @@ decided something, so they are kept here (the ledger keeps them regardless — t
   reads 0.43 W, next to upstream's `nocturna-real` (0.46 W over 9.5 h) — but it followed an idle
   evening, and one row is one shutdown. A night that follows a day of real work is still unmeasured,
   as is any window longer than the ~11 h this battery can carry unshielded.
-* **The `FINAL` line after `device_shutdown()` — and not because it is not printed.** On 2026-10-06
-  the photo's last readable line was `done:` (the end of the reboot notifier, *before* the walk), and
-  the screen then stayed dark **with the backlight on for 5–8 s** — the length of `final_hold_ms=8000`
-  — before the machine switched off. That is the hold executing, so the `POWER_OFF_PREPARE` observer
-  did run and did print; the display is down by then, because the device walk takes it down before the
-  observer is called. The line is unobservable on this unit, and what the photographed run does
-  establish is the arming block — the state *before* the walk, already `D3cold`.
+* **The `FINAL` line after `device_shutdown()` — never observed here.** `done:` (the end of the reboot
+  notifier) is the last line on screen; the display then stays dark **with the backlight on** for about
+  five seconds before the machine switches off. That interval is the same with `final_hold_ms=8000`
+  (5–8 s) and with the default `0` (~5 s), so it belongs to the machine's own S5 transition and not to
+  the hold — and a hold that leaves no trace is a hold that did not run, which means there is no
+  evidence the `POWER_OFF_PREPARE` observer was ever called. Either the display is already down when it
+  is, or the handler is not reached on this poweroff path. What the photographed run does establish is
+  the arming block, printed one step earlier: the state *before* the walk, already `D3cold`.
 
 ## Lessons, written down
 
