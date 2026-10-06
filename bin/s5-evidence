@@ -102,8 +102,9 @@ selftest() {
 	try "no boot record after it"         "$(mk noboot 60.000 0 0      0 0    2026-10-06 06:00:00 0)" refuse 'no boot witness'
 	try "poisoned, 40 Wh / 2 h = 20 W"    "$(mk poison 60.000 0 20.000 0 120  2026-10-06 00:00:00 1)" row    'poisoned'
 	try "window of 12 minutes"            "$(mk short  60.000 0 59.900 0 120  2026-10-05 22:12:00 1)" refuse 'only'
-	# El look-alike que se coló el 2026-10-06: medidor clavado en el 100%, cero
-	# exacto entre los dos extremos, que es un numero impecable sin medida dentro.
+	# The look-alike that slipped through on 2026-10-06: gauge pinned at 100%, an
+	# exact zero between the two ends, which is a flawless number with no measurement
+	# inside it.
 	try "gauge pinned, 0 Wh over 10 h"    "$(mk pinned 60.000 0 60.000 0 120  2026-10-06 10:00:00 1)" refuse 'identical'
 
 	echo
@@ -237,20 +238,20 @@ appendix for this row (paste under the table, it is what makes the row auditable
   cross-check: independent arithmetic, agreed with s5-verdict to <= 0.02 W
 EOF
 
-# LA BATERIA QUE SE AGOTA NO ES UNA TASA. En una linea base (~20 W) la bateria de
-# esta maquina da para unas 3-4 h: si la ventana dura mas, el EC corta al final y
-# ese tramo no consume a ese ritmo, asi que los vatios salen ALTOS pero son un
-# suelo, no lo que gastaria indefinidamente. Se calcula la magnitud y se dice,
-# en vez de dar por bueno el numero (regla 31 de la casa).
+# A BATTERY THAT RUNS OUT IS NOT A RATE. On a baseline (~20 W) this machine's
+# battery lasts about 3-4 h: if the window lasts longer, the EC cuts off at the
+# end and that final stretch does not draw at that rate, so the watts come out
+# HIGH but they are a floor, not what it would spend indefinitely. The magnitude
+# is computed and stated, instead of taking the number at face value (house rule).
 pct_boot=$(field "$bootpart" 's/^battery: [0-9.]* Wh (\([0-9.]*\)%).*/\1/p')
 if [ -n "$pct_boot" ] && awk -v p="$pct_boot" 'BEGIN { exit !(p <= 10) }'; then
 	cat <<EOF
 
-AVISO - la bateria estaba al ${pct_boot}% al arrancar. Con este consumo la maquina se queda
-sin bateria en unas horas (78 Wh a ~20 W = ~3,9 h), asi que si la ventana duro mas, el tramo
-final NO consumio a ese ritmo: los vatios de arriba son un SUELO, no una tasa constante. Para
-una fila comparable, carga al 100% y mide lo que la bateria aguanta; la fila con la que se
-compare tiene que durar lo mismo.
+WARNING - the battery was at ${pct_boot}% when the machine booted. At this draw the machine runs
+out of battery within a few hours (78 Wh at ~20 W = ~3.9 h), so if the window lasted longer, the
+final stretch did NOT draw at that rate: the watts above are a FLOOR, not a constant rate. For a
+comparable row, charge to 100% and measure what the battery takes; the row it is compared against
+has to last the same.
 EOF
 fi
 echo

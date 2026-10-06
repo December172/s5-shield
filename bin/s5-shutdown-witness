@@ -243,10 +243,10 @@ check_backward() {
 				exit 0
 			}
 			if (d == 0) {
-				# Un cero exacto no es una ventana perfecta, es un medidor
-				# clavado: paso el 2026-10-06 con la bateria al 100% al
-				# empezar la ventana. No entra en el libro mayor, porque el
-				# libro mayor es justo lo que se cita como crudo.
+				# An exact zero is not a perfect window, it is a gauge pinned
+				# shut: it happened on 2026-10-06 with the battery at 100% when
+				# the window started. It does not go into the ledger, because the
+				# ledger is exactly what gets quoted as raw.
 				printf "backward: the battery reads the same at both ends (0 Wh over %.2f h) - the gauge stayed pinned, so this window has no measurement in it and no ledger line is written\n", h;
 				exit 0
 			}
