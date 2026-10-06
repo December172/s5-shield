@@ -55,7 +55,8 @@ the PCI core walks the device list it has already:
    `rpm_check_suspend_allowed()` uses: `-EACCES` disabled, `-EAGAIN` a held reference, `-EBUSY` an
    active child). The waiting half is load-bearing and was measured to be: with the same module
    binary, arming a subtree that is still awake with no wait left the rail on (18.51 W), and 20 s of
-   waiting cut it (0.43 W over 11 h). See *Result*;
+   waiting cut it — 0.43 W over 11 h, and in the baseline's own 2.5 h window **0.42 W** against the
+   unshielded 20.33 W. See *Result*;
 1. **disabled runtime PM** on the listed devices (`__pm_runtime_disable()`), so the
    `pm_runtime_resume()` above bounces with `-EACCES` instead of powering the GPU up
    (`drivers/base/power/runtime.c:798-808`);
@@ -87,9 +88,11 @@ that gets armed stays awake for the whole of S5. The wait can only *ask* (`pm_re
 refused with `-EAGAIN` while a reference is held and `-EBUSY` while a child is active; an accepted
 request then waits out the autosuspend delay), so what it buys is the case that *can* settle but has
 not been asked yet — which on this machine is the normal one. It returns the moment the subtree is
-settled, so a generous budget costs nothing when the GPU is already asleep and at most itself when
-it cannot settle at all. Phase 1 asks every listed device to go idle once; only phase 2 spends the
-budget polling, so the result no longer depends on the order of `devs=`.
+settled, and the photographed 2026-10-06 poweroff is what that costs in practice: it spent **100 ms**
+of the budget, because the dGPU was already `D3cold` when the module armed. So a generous budget costs
+nothing when the GPU is already asleep and at most itself when it cannot settle at all. Phase 1 asks
+every listed device to go idle once; only phase 2 spends the budget polling, so the result no longer
+depends on the order of `devs=`.
 
 **What decides the rail is measured, not inferred.** The `FINAL` lines come from a
 `SYS_OFF_MODE_POWER_OFF_PREPARE` handler (`s5_shield_observe_final()`) that prints after the device
@@ -268,21 +271,24 @@ second instead of 5–8.)
 
 ## Result
 
-Three judged windows, all on battery with the charger unplugged at both ends, all with the witness
+Four judged windows, all on battery with the charger unplugged at both ends, all with the witness
 record carrying its raw registers (`docs/EVIDENCE.md` has the table, the gates and the ledger):
 
 | when | configuration | off window | result |
 |---|---|---|---|
 | 10-04 12:06 → 14:37 | **no shield at all** (`modprobe -r`) | 2.52 h | 51.242 Wh ⇒ **20.33 W** — this unit's own "before" |
+| 10-06 10:49 → 13:15 | **1.5, `wait_ms=20000`** (the shipped default) | 2.43 h | 1.031 Wh ⇒ **0.42 W** — the "after", in the baseline's own window: **a 48× drop** |
 | 10-04 23:03 → 23:24 | 1.4, `wait_ms=0` | 0.34 h | 6.288 Wh ⇒ **18.51 W** — it armed a subtree that was awake; ledger `FAIL`, check: *the rail was NOT cut* |
-| 10-04 23:37 → 10-05 10:44 | 1.5, `wait_ms=20000` (the new default) | 11.12 h | 4.771 Wh ⇒ **0.43 W** — ledger `OK` |
+| 10-04 23:37 → 10-05 10:44 | 1.5, `wait_ms=20000` | 11.12 h | 4.771 Wh ⇒ **0.43 W** — ledger `OK` |
 
-The middle row is what earns the other two: it is the **same module binary** as the last row
+The first two rows are the pair: same machine, same window length (2.43 h against 2.52 h, and the
+shorter one is the shielded one — a shorter window reads *higher* for the same S5, so the residual
+difference runs against the fix, not for it), shield off against shield on — **20.33 W to 0.42 W**.
+The third row is what earns the rest: it is the **same module binary** as the fourth
 (`srcversion 5ABD41F6E01E06E371E5D2F`) with one parameter changed, and it is what turned "the wait
-does not pay for itself" into a measured falsehood. The last row sits next to upstream's own night
-on the reference machine (0.46 W over 9.5 h) — and it is *not* comparable to the 2.52 h baseline
-under rule 1: a longer window spreads the fixed boot cost thinner, which flatters it, and it still
-read 0.43 W.
+does not pay for itself" into a measured falsehood. The 11.12 h row also sits next to upstream's own
+night on the reference machine (0.46 W over 9.5 h), though as a different window it may not be
+subtracted from the baseline under rule 1.
 
 * Chassis cold after the 11-hour window — the symptom this started from, gone.
 * The 2026-10-03 50-minute run (~1 W, revision 1.3, `wait_ms=5000`) was the first hint that the wait

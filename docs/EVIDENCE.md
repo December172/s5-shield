@@ -18,10 +18,10 @@ between 0 and non-zero is the difference between 18.51 W and 0.43 W on this mach
    window contains a fixed cost E₀ — the power-on, the boot, and the first minutes of a machine that
    draws 24–78 W awake — so a short window always reads higher than a long one for the same S5.
    Quote **Wh and the window**; derive W from those two only against windows of comparable length.
-   This machine's E₀ is **not yet pinned**, which is why every row states its window. The one legal
-   pair under rule 1 is still owed: `baseline-no-shield` (2.52 h, no shield) against a clean window
-   of the *same* length with 1.5. The 11.12 h row below is a stronger result but a different window,
-   so it may not be subtracted from the baseline.
+   This machine's E₀ is **not yet pinned**, which is why every row states its window. The legal pair
+   under rule 1 is now measured: `baseline-no-shield` (2.52 h, no shield, 20.33 W) against
+   `clean-window-1.5` (2.43 h, shield on, 0.42 W) — see the table below. The 11.12 h row is a
+   stronger result but a different window, so it may not be subtracted from the baseline.
 2. **A window with the charger connected is void, not "clean".** `bin/s5-evidence` refuses to emit a
    row for one, at either end.
 3. **Do not publish a row the tool refused.** Every failure mode here — charger on, a battery that
@@ -67,7 +67,7 @@ sudo systemctl poweroff        # watch the console: the FINAL lines are the last
 | 10-03 | `ac-on-void` (23:56 → 09:38) | revision 1.3, charger connected throughout | refused by the gate (both ends) | **VOID** — quoted only to show the gate works |
 | 10-04 | `baseline-no-shield` | shield **removed** (`sudo modprobe -r s5_shield`), charger out, 2.52 h window — this unit's own "before" | **51.242 Wh / 2.52 h ⇒ 20.33 W** | **POISONED** — deliberate: the row measures the drain with nothing shielding it, and it lands in the same 18.7–24 W class as the reference machine. Raw registers: appendix of the fork's `docs/EVIDENCE-second-unit.md`, and the untrimmed `/var/lib/s5-shield/rows.tsv` |
 | 10-04/05 | `probe-wait-20s` | revision 1.4 with `wait_ms=20000` restored — the parameter 1.5 now defaults to — charger out at both ends | **4.771 Wh / 11.12 h ⇒ 0.43 W** (the boot itself is inside that window) | **CLEAN** — n=1, ledger verdict `OK`. Raw registers in `/var/lib/s5-shield/rows.tsv` and the witness log. Not comparable to the 2.52 h baseline under rule 1 (a longer window flatters the number, and it still read 0.43 W); it *is* comparable to upstream's `nocturna-real` (0.46 W over 9.5 h) |
-| — | `clean-window-1.5` | revision 1.5, `wait_ms=20000` (the default), **the same 2.52 h window** as the baseline | *to be measured* | *pending* — the row that completes the legal pair |
+| 10-06 | `clean-window-1.5` | revision 1.5, `wait_ms=20000` (the shipped default); the baseline's window, 2.43 h against its 2.52 h — 3.7% shorter, and a shorter window reads *higher* for the same S5, so the residual difference is against the fix rather than for it | **1.0310 Wh / 2.4278 h ⇒ 0.42 W** | **CLEAN** — ledger `OK`. With `baseline-no-shield` this is the legal pair under rule 1: **20.33 W → 0.42 W**, a 48× drop, same machine, same window, shield off against shield on |
 
 **The wait is not optional, and that was measured the hard way.** Revision 1.4 shipped `wait_ms=0`
 on the theory that the dGPU falls asleep later anyway, inside `device_shutdown()`. The diagnostics
@@ -101,10 +101,11 @@ decided something, so they are kept here (the ledger keeps them regardless — t
 
 ## What is *not* measured here
 
-* **This unit's pre-fix drain** is no longer borrowed from anywhere: the `baseline-no-shield` row
-  above is this unit's own "before" (20.33 W over 2.52 h, shield removed). What is still missing is
-  the clean window of the same length — until that row exists, the pair is not complete and no
-  before/after claim may be made from it.
+* **The before/after is no longer outstanding.** This unit has its own pair, both windows measured on
+  this machine and both stated with their length: `baseline-no-shield` 20.33 W over 2.52 h against
+  `clean-window-1.5` 0.42 W over 2.43 h. The shielded side is the shorter window, and a shorter
+  window reads higher for the same S5, so whatever E₀ does to the comparison it does in the fix's
+  disfavour.
 * **A busy dGPU at poweroff** — CUDA job, external display, PRIME offload. Upstream covers that case
   with a 90 s wait plus a GRUB `halt`; this machine has no fallback yet, and the shield would freeze
   such a GPU awake. No row here covers it, and none should be read as if it did.
