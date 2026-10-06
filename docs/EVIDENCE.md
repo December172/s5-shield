@@ -66,7 +66,7 @@ sudo systemctl poweroff        # watch the console: the FINAL lines are the last
 | 10-03 | `clean-50min-1.3` | revision 1.3: shield armed with the dGPU in `D0`, `wait_ms=5000` ran to its full budget and gave up | ≤1 Wh / 0.83 h ⇒ **≈1 W** (raw window 2.2 Wh, of which 1.2–2.9 Wh is the uptime inside it) | **CLEAN** — n=1. Source: README *Result*; the witness record itself was trimmed by the log cap, so its raw registers can no longer be re-read |
 | 10-03 | `ac-on-void` (23:56 → 09:38) | revision 1.3, charger connected throughout | refused by the gate (both ends) | **VOID** — quoted only to show the gate works |
 | 10-04 | `baseline-no-shield` | shield **removed** (`sudo modprobe -r s5_shield`), charger out, 2.52 h window — this unit's own "before" | **51.242 Wh / 2.52 h ⇒ 20.33 W** | **POISONED** — deliberate: the row measures the drain with nothing shielding it, and it lands in the same 18.7–24 W class as the reference machine. Raw registers: appendix of the fork's `docs/EVIDENCE-second-unit.md`, and the untrimmed `/var/lib/s5-shield/rows.tsv` |
-| 10-04/05 | `probe-wait-20s` | revision 1.4 with `wait_ms=20000` restored — the parameter 1.5 now defaults to — charger out at both ends | **4.771 Wh / 11.12 h ⇒ 0.43 W** (the boot itself is inside that window) | **CLEAN** — n=1, ledger verdict `OK`. Raw registers in `/var/lib/s5-shield/rows.tsv` and the witness log. Not comparable to the 2.52 h baseline under rule 1 (a longer window flatters the number, and it still read 0.43 W); it *is* comparable to upstream's `nocturna-real` (0.46 W over 9.5 h) |
+| 10-04/05 | `probe-wait-20s` | revision 1.4 with `wait_ms=20000` restored — the parameter 1.5 now defaults to — charger out at both ends | **4.771 Wh / 11.12 h ⇒ 0.43 W** (the boot itself is inside that window) | **CLEAN** — n=1, ledger verdict `OK`. Raw registers in `/var/lib/s5-shield/rows.tsv` and the witness log. Not comparable to the 2.52 h baseline under rule 1 (a longer window flatters the number, and it still read 0.43 W); it *is* comparable to upstream's `nocturna-real-v2` (0.46 W over 8.60 h) |
 | 10-06 | `clean-window-1.5` | revision 1.5, `wait_ms=20000` (the shipped default); the baseline's window, 2.43 h against its 2.52 h — 3.7% shorter, and a shorter window reads *higher* for the same S5, so the residual difference is against the fix rather than for it | **1.0310 Wh / 2.4278 h ⇒ 0.42 W** | **CLEAN** — ledger `OK`. With `baseline-no-shield` this is the legal pair under rule 1: **20.33 W → 0.42 W**, a 48× drop, same machine, same window, shield off against shield on |
 
 **The wait is not optional, and that was measured the hard way.** Revision 1.4 shipped `wait_ms=0`
@@ -110,7 +110,7 @@ decided something, so they are kept here (the ledger keeps them regardless — t
   with a 90 s wait plus a GRUB `halt`; this machine has no fallback yet, and the shield would freeze
   such a GPU awake. No row here covers it, and none should be read as if it did.
 * **A whole night after a normal day's use.** The 11.12 h row above *is* an overnight window and
-  reads 0.43 W, next to upstream's `nocturna-real` (0.46 W over 9.5 h) — but it followed an idle
+  reads 0.43 W, next to upstream's `nocturna-real-v2` (0.46 W over 8.60 h) — but it followed an idle
   evening, and one row is one shutdown. A night that follows a day of real work is still unmeasured,
   as is any window longer than the ~11 h this battery can carry unshielded.
 * **The `FINAL` line after `device_shutdown()` — never observed here.** `done:` (the end of the reboot

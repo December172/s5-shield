@@ -287,9 +287,9 @@ shorter one is the shielded one — a shorter window reads *higher* for the same
 difference runs against the fix, not for it), shield off against shield on — **20.33 W to 0.42 W**.
 The third row is what earns the rest: it is the **same module binary** as the fourth
 (`srcversion 5ABD41F6E01E06E371E5D2F`) with one parameter changed, and it is what turned "the wait
-does not pay for itself" into a measured falsehood. The 11.12 h row also sits next to upstream's own
-night on the reference machine (0.46 W over 9.5 h), though as a different window it may not be
-subtracted from the baseline under rule 1.
+does not pay for itself" into a measured falsehood. The 11.12 h row also sits next to upstream's
+closest night on the reference machine, `nocturna-real-v2` (0.46 W over 8.60 h), though as a
+different window it may not be subtracted from the baseline under rule 1.
 
 * Chassis cold after the 11-hour window — the symptom this started from, gone.
 * The 2026-10-03 50-minute run (~1 W, revision 1.3, `wait_ms=5000`) was the first hint that the wait
