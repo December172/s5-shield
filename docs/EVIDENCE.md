@@ -25,8 +25,9 @@ between 0 and non-zero is the difference between 18.51 W and 0.43 W on this mach
 2. **A window with the charger connected is void, not "clean".** `bin/s5-evidence` refuses to emit a
    row for one, at either end.
 3. **Do not publish a row the tool refused.** Every failure mode here — charger on, a battery that
-   went *up*, a boot sample taken minutes after boot, a missing boot record, a 12-minute window —
-   still produces a number, and a number with a decimal point looks like evidence.
+   went *up*, a battery that did not move **at all**, a boot sample taken minutes after boot, a
+   missing boot record, a 12-minute window — still produces a number, and a number with a decimal
+   point looks like evidence. `bin/s5-evidence` now refuses the zero-delta case by name; see lesson 4.
 4. **"What changed" is recorded before the run, not recalled after it.**
    `bin/s5-evidence label "<short>" "<what changed>"` writes `/var/lib/s5-shield/label`; both witness
    records quote it (`label:` / `change:`) and the row is generated from it.
@@ -40,6 +41,8 @@ between 0 and non-zero is the difference between 18.51 W and 0.43 W on this mach
 /mnt/Shared/Development/Project/Others/s5-shield/bin/s5-evidence label "clean-window-1.5" \
         "revision 1.5, wait_ms=20000, shield armed"
 /mnt/Shared/Development/Project/Others/s5-shield/bin/s5-battery   # note it, UNPLUG the charger
+# start from a partly discharged pack, NOT from 100% (lesson 4), and not from below
+# ~25%: the window has to survive its own worst case without the EC cutting early.
 sudo systemctl poweroff        # watch the console: the FINAL lines are the last thing printed
 # after the next boot
 /mnt/Shared/Development/Project/Others/s5-shield/bin/s5-evidence  # the row, or why it refuses
@@ -94,6 +97,7 @@ decided something, so they are kept here (the ledger keeps them regardless — t
 |---|---|---|---|---|
 | 10-04 23:03 → 23:24 | 1.4, `wait_ms=0`, shield loaded and armed | 0.34 h | 6.288 Wh ⇒ **18.51 W**, ledger `FAIL` | arming an awake subtree with no wait leaves the rail on — this is the measurement that put the wait back in 1.5 |
 | 10-04 17:31 → 17:32 and 20:24 → 20:24 | 1.4, charger connected at both ends | 0.5 and 0.0 min | not judged; no row emitted | the charger gate and the backward check working as designed — nothing may be read from either window |
+| 10-06 00:21 → 10:27 | 1.5, `wait_ms=20000`, charger out, the pack at **100%** when the window opened | 10.10 h | `energy_now` byte-identical at both ends: **0.000 Wh ⇒ 0.00 W**, and the tools published it | the gauge stayed pinned at full and never integrated the S5 draw (`voltage_now` still fell 12.194 → 11.696 V, and the reading moved as soon as the machine was back under load). The rail was cut — a ~20 W S5 would have flattened this pack in ~4 h, and it booted after 10 — but the window contains no number, so it is not a row. This is what made the zero-delta gate necessary |
 
 ## What is *not* measured here
 
@@ -127,3 +131,11 @@ decided something, so they are kept here (the ledger keeps them regardless — t
    at the moment of no return is what let the very next measured poweroff show the theory was wrong
    (18.51 W with no wait against 0.43 W with it), instead of leaving two plausible stories and no way
    to choose. A measurement that cannot embarrass its author is not measuring anything.
+4. **A gauge at 100% is not a gauge.** The 2026-10-06 overnight window opened with the pack full and
+   closed with `energy_now` reading exactly the same value — 81083000 µWh at both ends of 10.10 h,
+   `capacity=100` both times, while `voltage_now` fell 12.194 → 11.696 V and the reading only started
+   moving once the machine was back under load. The tools turned that into **0.00 W — CLEAN**: a
+   perfect number for a window with no measurement in it, and precisely the shape of failure rule 3
+   warns about. Both tools now refuse a zero delta by name (`bin/s5-evidence`, and the witness no
+   longer writes a ledger line for one). The lesson is not "the gauge lies": it is that an instrument's
+   *range* is part of the protocol, and a window that starts at the top of the range measures nothing.

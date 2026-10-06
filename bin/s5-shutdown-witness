@@ -242,6 +242,14 @@ check_backward() {
 				printf "backward: last poweroff ended %.0f min ago, too short to judge (a reboot?)\n", h*60;
 				exit 0
 			}
+			if (d == 0) {
+				# Un cero exacto no es una ventana perfecta, es un medidor
+				# clavado: paso el 2026-10-06 con la bateria al 100% al
+				# empezar la ventana. No entra en el libro mayor, porque el
+				# libro mayor es justo lo que se cita como crudo.
+				printf "backward: the battery reads the same at both ends (0 Wh over %.2f h) - the gauge stayed pinned, so this window has no measurement in it and no ledger line is written\n", h;
+				exit 0
+			}
 			w = d / h;
 			# Machine-readable copy for the permanent ledger below. The log
 			# itself is capped, and the record of a good measurement must not

@@ -102,6 +102,9 @@ selftest() {
 	try "no boot record after it"         "$(mk noboot 60.000 0 0      0 0    2026-10-06 06:00:00 0)" refuse 'no boot witness'
 	try "poisoned, 40 Wh / 2 h = 20 W"    "$(mk poison 60.000 0 20.000 0 120  2026-10-06 00:00:00 1)" row    'poisoned'
 	try "window of 12 minutes"            "$(mk short  60.000 0 59.900 0 120  2026-10-05 22:12:00 1)" refuse 'only'
+	# El look-alike que se coló el 2026-10-06: medidor clavado en el 100%, cero
+	# exacto entre los dos extremos, que es un numero impecable sin medida dentro.
+	try "gauge pinned, 0 Wh over 10 h"    "$(mk pinned 60.000 0 60.000 0 120  2026-10-06 10:00:00 1)" refuse 'identical'
 
 	echo
 	if [ "$fails" = 0 ]; then
@@ -174,6 +177,14 @@ EOF
 	[ "$ac_boot" = 1 ] && fail "the charger was connected at boot (ac_online=1): the window is void"
 	awk -v h="$h" -v m="$MIN_H" 'BEGIN { exit !(h < m) }' && fail "the off window is only ${h} h; below ${MIN_H} h the shutdown's own fixed cost swamps the signal"
 	awk -v d="$d" 'BEGIN { exit !(d < 0) }' && fail "the battery went up by ${d#-} Wh between the two records: gauge drift or charging, not a measurement"
+	# Exactly zero is never physical: an off machine draws the EC and the real-time
+	# clock at the very least, and the gauge reports in uWh. Measured 2026-10-06: a
+	# pack that started the window at 100% reported energy_now=81083000 uWh at both
+	# ends of a 10.1 h window (capacity=100 both times) while voltage_now moved
+	# 12.194 -> 11.696 V, and the reading only moved once the machine was back under
+	# load. The rail was fine; the instrument was pinned, so there is no number here
+	# to publish.
+	awk -v d="$d" 'BEGIN { exit !(d == 0) }' && fail "E0 and E1 are identical (0 Wh moved over ${h} h): the gauge stayed pinned, which is what a pack that starts the window at 100% does here - the window has no measurement in it"
 	[ -n "$up_boot" ] && awk -v u="$up_boot" -v l="$BOOT_LATE_S" 'BEGIN { exit !(u > l) }' && \
 		fail "the boot record was written ${up_boot} s after boot, not at boot: it contains awake time"
 
