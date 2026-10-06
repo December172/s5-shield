@@ -8,6 +8,12 @@ Status: **installed and measured working** on this machine — see *Result*. The
 the module as DKMS `s5-shield/1.5`; the machine's registration moves to it the next time
 `install.sh` runs.
 
+This repository is the published home of the module and of this unit's rows: upstream's
+[second-unit evidence document](https://github.com/AnxoCalvo/s5-poweroff-fix/blob/main/docs/EVIDENCE-second-unit.md)
+states that the implementation, its tooling and its evidence file live here. It **stays published**
+— running the reference policy on this machine instead would not change that, and neither would
+the module being packaged for a different distribution.
+
 ## The problem
 
 Screen dark, machine silent, chassis warm near the GPU, battery flat by morning — an "S5" that
