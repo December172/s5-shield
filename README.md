@@ -179,7 +179,8 @@ the default wait prints the same block plus its own lines — `asking runtime PM
 up to 20000 ms`, any state change it sees while polling, and then either `settled after N ms` or
 `not settled after 20000 ms … arming anyway - expect the rail to stay on`. The `FINAL` lines after
 them are the shape this revision is expected to print: the measured night (0.43 W) says the subtree
-did end up asleep, but those console lines have not been photographed yet.
+did end up asleep, but those console lines have not been photographed yet — the 1.5 *arming* block
+has been, and it is below.
 
 ```
 s5-shield: poweroff path, 3 device(s) listed
@@ -204,21 +205,50 @@ reports a subtree that is already `D3cold`/`D3hot`, with `FINAL` agreeing.** The
 warnings below are the module being accurate rather than reassuring: they are what 1.4 printed when
 it armed with the dGPU awake and no wait — the configuration measured at 18.51 W. With the 1.5
 default those two lines should not appear, because the wait either settles the subtree or says out
-loud that it could not. (The `FINAL` values in this transcript are still the expected shape rather
-than a photograph: the 11-hour night proves the rail was cut, not which line said so.)
+loud that it could not.
+
+**Photographed once, on 2026-10-06** (the overnight poweroff, 1.5 with `wait_ms=20000`), the arming
+block does read like that:
+
+```
+s5-shield: poweroff path, 3 device(s) listed
+s5-shield: 0000:01:00.0 is in D3cold, not asleep; asking runtime PM to let go and waiting up to 20000 ms for its bridge out of D0
+s5-shield: settled after 100 ms: 0000:01:00.0 D3cold, bridge out of D0
+s5-shield: state=D3cold … driver=nvidia rpm=suspended use=0 child=0 dis=0 auto=yes parent=suspended
+s5-shield: .shutdown of 'nvidia' nulled
+s5-shield: state=D3cold … driver=snd_hda_intel rpm=suspended use=0 child=0 dis=0 auto=yes parent=suspended
+s5-shield: state=D3cold … driver=pcieport rpm=suspended use=0 child=0 dis=0 auto=yes parent=suspended
+s5-shield: bridge: .shutdown of 'pcieport' left in place on purpose
+s5-shield: done: runtime PM off on 3, .shutdown nulled on 2, skipped 0
+```
+
+Note what did *not* have to happen: the dGPU was **already `D3cold`** when the module armed, so the
+20 s budget was spent in 100 ms and only on waiting for the bridge. The wait is not a toll paid on
+every poweroff — it is insurance for the poweroff where the subtree is still awake, which is exactly
+the one measured at 18.51 W. The original photo is
+[`docs/img/console-2026-10-06-overnight.jpg`](docs/img/console-2026-10-06-overnight.jpg).
+
+The `FINAL` lines after `done:` are **not readable on this machine**, and it is not the shutter's
+fault. `done:` — the end of the reboot notifier — was the last line on screen; after it the display
+went dark *with the backlight still on* for 5–8 s, and only then did the machine switch off. Five to
+eight seconds is `final_hold_ms=8000` executing. So the `POWER_OFF_PREPARE` observer runs and prints,
+but `device_shutdown()` has already taken the display down by the time it does. Read the arming block
+(now measured) and the window; the `FINAL` line stays a diagnostic this unit cannot show.
 
 ## Reading the console
 
-Two things tell you everything after a poweroff, and both appear on the console during shutdown and
-in `journalctl -b -1 -k`. The arming lines (revision 1.4) say *why* each device is where it is; the
+Two things tell you everything after a poweroff, and both exist **only on the console**: they are
+printed after `journald` has already stopped, so the journal of the previous boot does not have them
+(`journalctl -b -1 -k` on this machine shows the boot's `ready:` line and nothing else from the
+poweroff). The arming lines (revision 1.4) say *why* each device is where it is; the
 `FINAL` lines say where the tree actually ended up, after `device_shutdown()` and before the
 firmware poweroff — the moment that decides the rail.
 
 | what you see | what it means | what to do |
 |---|---|---|
-| the wait reports `settled after N ms`, the arming block shows `D3cold`/`D3hot`, `FINAL` agrees | the subtree was asleep before it was armed, so nothing could wake it: the rail was cut before the firmware took over. This is the **healthy** case with the 1.5 default (0.43 W measured over 11.12 h). | nothing — this is the fix working |
+| the wait reports `settled after N ms`, the arming block shows `D3cold`/`D3hot`, `FINAL` agrees | the subtree was asleep before it was armed, so nothing could wake it: the rail was cut before the firmware took over. This is the **healthy** case with the 1.5 default (0.43 W measured over 11.12 h; the photographed run settled in **100 ms** with the dGPU already `D3cold`). | nothing — this is the fix working |
 | the wait reports `not settled after 20000 ms`, and `FINAL` still shows the GPU or the bridge in `D0` | the subtree was armed awake (`use=` a held reference, `child=` an active device below): the rail is very likely still on — 18.51 W was measured exactly this way. | find the holder in the two counters; a held reference is what no wait can clear, so this is the case for a shutdown-time fallback (upstream's 90 s + GRUB `halt`; this machine has none yet) |
-| no `FINAL` line at all | the observer did not register — check the boot line `ready: … FINAL observer=on`, or that the kernel reached power-off-prepare. | nothing: the shield works without it, you only lose the measurement |
+| no `FINAL` line at all | it is printed but not visible: `device_shutdown()` takes the display down before `POWER_OFF_PREPARE` calls the observer, so the lines go to a console nobody can see. 2026-10-06: `done:` was the last visible line, then a dark screen **with the backlight on** for 5–8 s — the `final_hold_ms` hold — before the machine switched off. The other two causes still exist: the observer did not register (check `ready: … FINAL observer=on`), or the kernel never reached power-off-prepare. | nothing: the shield works without it, and the arming block — which *is* visible — already says whether the subtree was asleep before it was armed |
 
 The fields: `rpm=` is the device's runtime PM status, `use=` is how many references hold it awake
 (`-EAGAIN` when the wait asks it to suspend), `child=` is how many devices below it are still active
@@ -229,14 +259,12 @@ A `D0` at the witness snapshot is **not** an alarm by itself: that snapshot is t
 poweroff notifier, and the module's wait runs after it. A `D0` that survives both the wait and the
 device walk is the alarm — that is what the `FINAL` line is for.
 
-The `FINAL` lines are printed immediately before the firmware is asked to power off, so they are on
-screen only for as long as the S5 transition takes. To photograph them at leisure, load the module
-with the diagnostic hold — it changes nothing else, and the next reboot drops it again:
-
-```bash
-sudo modprobe -r s5_shield && sudo modprobe s5_shield final_hold_ms=8000
-# ... now power off and photograph the screen; nothing to undo afterwards
-```
+**Do not set the diagnostic hold.** It was used on 2026-10-06 (`final_hold_ms=8000`) and what the
+screen did afterwards is the answer above: the observer printed to a display that was already down,
+and the only visible effect of the hold was 5–8 s of dark screen with the backlight on before the
+machine switched off. It delays the poweroff and shows you nothing. (The interval is also its own
+confirmation: the next window, run with the default `final_hold_ms=0`, should sit dark for about a
+second instead of 5–8.)
 
 ## Result
 

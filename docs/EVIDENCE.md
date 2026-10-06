@@ -90,14 +90,14 @@ policy layer, the wait is the only thing that can settle the subtree.
 
 ## Diagnostics (not rows)
 
-Windows below the 0.5 h gate are not rows and are never quoted as if they were, but two of them
+Windows below the 0.5 h gate are not rows and are never quoted as if they were, but three of them
 decided something, so they are kept here (the ledger keeps them regardless — that is what it is for):
 
 | when | config | window | result | what it decided |
 |---|---|---|---|---|
 | 10-04 23:03 → 23:24 | 1.4, `wait_ms=0`, shield loaded and armed | 0.34 h | 6.288 Wh ⇒ **18.51 W**, ledger `FAIL` | arming an awake subtree with no wait leaves the rail on — this is the measurement that put the wait back in 1.5 |
 | 10-04 17:31 → 17:32 and 20:24 → 20:24 | 1.4, charger connected at both ends | 0.5 and 0.0 min | not judged; no row emitted | the charger gate and the backward check working as designed — nothing may be read from either window |
-| 10-06 00:21 → 10:27 | 1.5, `wait_ms=20000`, charger out, the pack at **100%** when the window opened | 10.10 h | `energy_now` byte-identical at both ends: **0.000 Wh ⇒ 0.00 W**, and the tools published it | the gauge stayed pinned at full and never integrated the S5 draw (`voltage_now` still fell 12.194 → 11.696 V, and the reading moved as soon as the machine was back under load). The rail was cut — a ~20 W S5 would have flattened this pack in ~4 h, and it booted after 10 — but the window contains no number, so it is not a row. This is what made the zero-delta gate necessary |
+| 10-06 00:21 → 10:27 | 1.5, `wait_ms=20000`, charger out, the pack at **100%** when the window opened | 10.10 h | `energy_now` byte-identical at both ends: **0.000 Wh ⇒ 0.00 W**, and the tools published it | the gauge stayed pinned at full and never integrated the S5 draw (`voltage_now` still fell 12.194 → 11.696 V, and the reading moved as soon as the machine was back under load). The rail was cut — a ~20 W S5 would have flattened this pack in ~4 h, and it booted after 10 — but the window contains no number, so it is not a row. This is what made the zero-delta gate necessary. The poweroff itself was instrumented, though: the console photo of that shutdown ([`docs/img/console-2026-10-06-overnight.jpg`](img/console-2026-10-06-overnight.jpg)) shows `0000:01:00.0 is in D3cold`, then `settled after 100 ms: 0000:01:00.0 D3cold, bridge out of D0`, and all three devices `state=D3cold … rpm=suspended use=0 child=0 dis=0`, with `.shutdown nulled on 2`. The subtree was already asleep when the module armed, so nothing could have woken it — the rail was cut. |
 
 ## What is *not* measured here
 
@@ -112,6 +112,13 @@ decided something, so they are kept here (the ledger keeps them regardless — t
   reads 0.43 W, next to upstream's `nocturna-real` (0.46 W over 9.5 h) — but it followed an idle
   evening, and one row is one shutdown. A night that follows a day of real work is still unmeasured,
   as is any window longer than the ~11 h this battery can carry unshielded.
+* **The `FINAL` line after `device_shutdown()` — and not because it is not printed.** On 2026-10-06
+  the photo's last readable line was `done:` (the end of the reboot notifier, *before* the walk), and
+  the screen then stayed dark **with the backlight on for 5–8 s** — the length of `final_hold_ms=8000`
+  — before the machine switched off. That is the hold executing, so the `POWER_OFF_PREPARE` observer
+  did run and did print; the display is down by then, because the device walk takes it down before the
+  observer is called. The line is unobservable on this unit, and what the photographed run does
+  establish is the arming block — the state *before* the walk, already `D3cold`.
 
 ## Lessons, written down
 
