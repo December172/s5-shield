@@ -4,10 +4,11 @@
 #     sudo /mnt/Shared/Development/Project/Others/s5-shield/uninstall.sh
 #
 # Removes everything the installer put on the machine: the loaded module, every
-# DKMS registration and its built module, the two config files, the source trees
-# and the optional shutdown witness. It touches nothing else - no boot image, no
-# boot entry, no kernel, no firmware setting. After this the machine behaves
-# exactly as it did before the installer ran.
+# DKMS registration and its built module, the two config files, the source trees,
+# the optional shutdown witness, and the opt-in firmware power-off path (the
+# divert unit plus the two tools in /usr/local/bin). It touches nothing else - no
+# boot image, no boot entry, no kernel, no firmware setting. After this the machine
+# behaves exactly as it did before the installer ran.
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,6 +35,14 @@ echo
 echo "=== 2. shutdown witness (only if it is installed) ==="
 if [ -f /etc/systemd/system/s5-shutdown-witness.service ] || [ -f /usr/local/bin/s5-shutdown-witness ]; then
 	"$SRC_DIR/witness.sh" remove
+else
+	echo "not installed"
+fi
+
+echo
+echo "=== 2b. firmware power-off path (only if it is installed) ==="
+if [ -f /etc/systemd/system/s5-halt-divert.service ] || [ -f /usr/local/bin/s5-halt-divert ]; then
+	"$SRC_DIR/halt.sh" remove
 else
 	echo "not installed"
 fi

@@ -1,0 +1,28 @@
+[Unit]
+Description=Route the poweroff through the firmware when the dGPU will not settle (s5-shield)
+Documentation=file:///mnt/Shared/Development/Project/Others/s5-shield/README.md
+
+# Same ordering as the witness unit, and for the same measured reason: with
+# DefaultDependencies=no the implicit Conflicts=/Before= pair with shutdown.target is
+# switched off, so both are spelled out. Stop ordering is the reverse of start
+# ordering, so being Before= the session manager means this unit's ExecStop runs
+# AFTER the compositor has closed /dev/nvidia0 - when the dGPU is free to suspend -
+# and still before shutdown.target, while /var and journald are alive.
+Conflicts=shutdown.target
+Before=shutdown.target
+Before=user@.service
+Before=user@1000.service
+Before=systemd-logind.service
+After=systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# ExecStart is a no-op: the decision only makes sense while shutting down.
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/s5-halt-divert
+# The script waits for the dGPU (S5_HALT_WAIT seconds, default 20) before deciding.
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

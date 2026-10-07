@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# s5-halt-divert: decide, during a shutdown, whether this poweroff should be routed
+# through the firmware instead of being paid at ~19 W.
+#
+# WHY. The shield settles the dGPU's subtree and lets the normal poweroff cut the
+# rail. When the subtree will NOT settle - a held reference, a driver that keeps the
+# device awake - that poweroff is expensive, and the clean way out is a boot in
+# which no kernel runs: the boot loader powers the machine off. `s5-halt` arms that
+# by hand; this is the automatic version.
+#
+# HOW IT IS TRIGGERED. As the ExecStop of s5-halt-divert.service, which is ordered
+# (like the witness) to run after the session manager and the compositor are gone -
+# so the dGPU is free to fall asleep - and before shutdown.target, so /var and
+# journald are still alive. It is opt-in: installing it changes what a poweroff can
+# do, so it is a separate command from install.sh.
+#
+# WHAT IT DOES, in order:
+#   1. brake file present -> say so, do nothing (a way to disarm without uninstalling)
+#   2. already D3cold        -> say so, do nothing: the normal poweroff is the cheap one
+#   3. wait up to S5_HALT_WAIT seconds for D3cold
+#   4. still awake           -> arm the one-shot, verify it, and reboot so the boot
+#                              loader powers off; if the arming fails, do NOT divert -
+#                              a normal poweroff is better than a reboot that boots
+#
+# Usage:  s5-halt-divert              decide and act (what the unit runs)
+#         s5-halt-divert --dryrun     decide and say, change nothing at all
+#
+# Knobs: S5_HALT_WAIT (seconds, default 20), S5_HALT_GPU (BDF),
+#        S5_HALT_BRAKE (file), S5_HALT_LOG, S5_HALT_CMD (path to s5-halt)
+set -u
+
+WAIT=${S5_HALT_WAIT:-20}
+GPU=${S5_HALT_GPU:-0000:01:00.0}
+BRAKE=${S5_HALT_BRAKE:-/var/lib/s5-shield/halt-divert-disabled}
+LOG=${S5_HALT_LOG:-/var/log/s5-shield-halt.log}
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+HALT=${S5_HALT_CMD:-/usr/local/bin/s5-halt}
+[ -x "$HALT" ] || HALT="$HERE/bin/s5-halt"
+
+DRYRUN=${S5_HALT_DRYRUN:-0}
+[ "${1:-}" = "--dryrun" ] && DRYRUN=1
+
+say() {
+	printf 's5-halt-divert: %s\n' "$*"
+	{ printf '%s s5-halt-divert: %s\n' "$(date -Is)" "$*" >>"$LOG"; } 2>/dev/null || true
+}
+
+state() { cat "/sys/bus/pci/devices/$GPU/power_state" 2>/dev/null || echo '?'; }
+port()  { cat "/sys/bus/pci/devices/0000:00:01.1/power_state" 2>/dev/null || echo '?'; }
+
+if [ -e "$BRAKE" ]; then
+	say "brake file $BRAKE is present: not diverting (the normal poweroff runs)"
+	exit 0
+fi
+
+if [ "$(state)" = D3cold ]; then
+	say "dGPU already in D3cold: normal poweroff, nothing to divert"
+	exit 0
+fi
+
+say "dGPU is $(state) (port $(port)): waiting up to ${WAIT}s for it to settle"
+i=0
+while [ "$i" -lt "$WAIT" ]; do
+	sleep 1
+	i=$((i + 1))
+	if [ "$(state)" = D3cold ]; then
+		say "settled after ${i}s: normal poweroff, nothing to divert"
+		exit 0
+	fi
+done
+
+say "did NOT settle in ${WAIT}s (dGPU $(state), port $(port)): this poweroff would cost ~19 W"
+if [ "$DRYRUN" = 1 ]; then
+	say "dry run: I would arm '$HALT arm' and reboot so the boot loader powers off"
+	exit 0
+fi
+
+if ! "$HALT" arm >/dev/null 2>&1; then
+	say "arming failed: NOT diverting, the normal poweroff continues (that is the safe half)"
+	exit 0
+fi
+say "armed: rebooting so the boot loader powers the machine off, with no kernel in that boot"
+say "(you will see a POST; that is expected)"
+
+sync
+systemctl --force reboot >/dev/null 2>&1
+sleep 3
+say "systemctl --force reboot did not take; using reboot -f"
+sync
+exec reboot -f

@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# s5-halt: arm a poweroff that goes through the FIRMWARE, for machines with
+# systemd-boot and no GRUB to `halt` from.
+#
+# WHY. On this model the dGPU can be awake when the machine powers off, and a
+# poweroff from a live Linux leaves the rail on (~19 W of fake S5). The one case
+# that is clean is a boot in which no kernel runs at all: the firmware does its own
+# S5 with the hardware as the boot loader left it. GRUB can do that with `halt`;
+# systemd-boot has no `halt`, but it can be told to power the machine off from the
+# boot loader itself, using its own "Power Off The System" entry.
+#
+# MEASURED on this unit, 2026-10-07, dGPU pinned awake on purpose (the hard case),
+# charger out, 0.76 h windows: 1.007 Wh / 0.7622 h => 1.32 W (ledger OK), against
+# grub-halt's 1.05 W over 45 min on the reference machine. The full write-up is in
+# docs/EVIDENCE.md.
+#
+# Usage:
+#   s5-halt              same as `status`
+#   s5-halt status       is the entry offered, is anything armed, does it work here
+#   s5-halt check        only the prerequisites, and say what is missing
+#   s5-halt arm          arm it: the NEXT boot powers off from the boot loader
+#   s5-halt disarm       remove the arming, before the next boot
+#
+# `arm`/`disarm` write an EFI variable, so they need root; `status` does not. The
+# variable is the whole mechanism: nothing is written to the ESP, nothing is
+# compiled, nothing is signed, and no boot entry is added or changed. That also
+# means arming works at the last moment, when the ESP is already unmounted.
+#
+# WHAT IT DOES NOT DO: decide for you. It arms when you ask; it does not watch the
+# dGPU and divert a poweroff by itself. Until that exists, arm it before a shutdown
+# you expect to be dirty (see the README).
+set -u
+
+EFIVARS=${S5_EFIVARS:-/sys/firmware/efi/efivars}
+ID=auto-poweroff
+CONF_LINE='auto-poweroff yes'
+BOOTCTL=$(command -v bootctl 2>/dev/null || true)
+
+say() { printf '  %s\n' "$*"; }
+bad() { printf '  !! %s\n' "$*" >&2; }
+
+esp() {
+	[ -n "$BOOTCTL" ] || return 1
+	"$BOOTCTL" --print-esp-path 2>/dev/null
+}
+
+# The one-shot variable. efivarfs puts 4 attribute bytes in front of the payload,
+# so the value starts at byte 5: skipping them is what makes the read-back able to
+# tell a correct arming from a broken one (getting this wrong once reported a
+# perfectly armed variable as a failure).
+oneshot_file() { ls -1 "$EFIVARS"/LoaderEntryOneShot-* 2>/dev/null | head -1; }
+oneshot_value() {
+	local v; v=$(oneshot_file) || return 1
+	[ -n "$v" ] || return 1
+	tail -c +5 <"$v" 2>/dev/null | tr -d '\0'
+}
+
+# Where the entry comes from: systemd-boot's own built-in entry, which exists when
+# loader.conf says `auto-poweroff yes` (loader v255+). No file of ours is involved.
+entry_available() {
+	local e; e=$(esp) || return 2
+	[ -d "$e/loader" ] || return 2			# ESP not mounted: cannot read it now
+	[ -f "$e/loader/loader.conf" ] || return 1
+	grep -qE "^[[:space:]]*auto-poweroff[[:space:]]+yes" "$e/loader/loader.conf"
+}
+
+loader_supports_oneshot() {
+	[ -n "$BOOTCTL" ] || return 1
+	"$BOOTCTL" status 2>/dev/null | grep -q 'One-shot entry control'
+}
+
+check() {
+	local fallos=0 e
+
+	printf '== what this machine needs ==\n'
+	if [ -n "$BOOTCTL" ]; then say "bootctl        : $BOOTCTL"
+	else bad "bootctl        : not found (this is systemd's own tool)"; fallos=$((fallos+1)); fi
+
+	if [ -d "$EFIVARS" ]; then say "efivarfs       : $EFIVARS"
+	else bad "efivarfs       : not mounted, so nothing can be armed"; fallos=$((fallos+1)); fi
+
+	e=$(esp) || e=''
+	if [ -n "$e" ] && [ -d "$e/loader" ]; then
+		say "ESP            : $e (mounted, so it can be read now)"
+		if entry_available; then
+			say "built-in entry : offered ($CONF_LINE in loader.conf)"
+		else
+			bad "built-in entry : NOT offered -> add '$CONF_LINE' to $e/loader/loader.conf (loader v255+)"
+			fallos=$((fallos+1))
+		fi
+		if loader_supports_oneshot; then
+			say "one-shot       : the boot loader announces 'One-shot entry control'"
+		else
+			bad "one-shot       : this boot loader does not announce it; the entry could not be armed"
+			fallos=$((fallos+1))
+		fi
+	else
+		say "ESP            : not mounted right now"
+		say "                 (arming does not need it: it is an EFI variable write."
+		say "                  The checks above that need it are skipped, not failed.)"
+	fi
+
+	printf '\n'
+	if [ "$fallos" = 0 ]; then
+		say 'ready. Arm it with:  sudo s5-halt arm'
+		return 0
+	fi
+	say "$fallos thing(s) missing; nothing was armed or written."
+	return 1
+}
+
+status() {
+	local v rc
+
+	printf '== the entry ==\n'
+	entry_available; rc=$?
+	case "$rc" in
+	0) say "built-in 'Power Off The System' entry: offered ($CONF_LINE)" ;;
+	1) bad "built-in entry: NOT offered -> add '$CONF_LINE' to loader.conf (loader v255+)" ;;
+	*) say 'built-in entry: cannot be read now (the ESP is not mounted)' ;;
+	esac
+	if loader_supports_oneshot 2>/dev/null; then
+		say "boot loader    : one-shot entries supported"
+	elif [ -n "$BOOTCTL" ]; then
+		say "boot loader    : one-shot support cannot be read now"
+	fi
+
+	printf '\n== is anything armed? ==\n'
+	if v=$(oneshot_value); then
+		say "ARMED: the next boot runs '$v'"
+		[ "$v" = "$ID" ] && say "       that is the firmware poweroff: the machine will not boot, it will switch off"
+		say "       undo it with:  sudo s5-halt disarm"
+	else
+		say 'nothing armed: the next boot is the normal one'
+	fi
+
+	printf '\n== the last firmware poweroff ==\n'
+	say 'there is no marker to read: this route runs no application and leaves no'
+	say 'kernel log (the machine is off). The evidence that it worked is the machine'
+	say 'itself; the watt comes from the next boot, with bin/s5-evidence.'
+}
+
+arm() {
+	local e v
+
+	[ "$(id -u)" = 0 ] || { bad 'this writes an EFI variable: use sudo'; exit 1; }
+	[ -d "$EFIVARS" ] || { bad "no $EFIVARS: nothing to arm"; exit 1; }
+	[ -n "$BOOTCTL" ] || { bad 'no bootctl: nothing to arm'; exit 1; }
+
+	# If the ESP happens to be readable, refuse to arm something that would do
+	# nothing. If it is not, arming is still valid: the variable is what the boot
+	# loader reads, and `auto-poweroff yes` was set when the entry was installed.
+	e=$(esp) || e=''
+	if [ -n "$e" ] && [ -d "$e/loader" ] && ! entry_available; then
+		bad "the built-in entry is not offered: add '$CONF_LINE' to $e/loader/loader.conf"
+		exit 1
+	fi
+
+	if ! "$BOOTCTL" set-oneshot "$ID" >/dev/null 2>&1; then
+		bad "'$BOOTCTL set-oneshot $ID' failed; nothing was armed"
+		exit 1
+	fi
+
+	v=$(oneshot_value) || { bad 'the variable is not there after arming; do not reboot blindly'; exit 1; }
+	if [ "$v" != "$ID" ]; then
+		bad "the variable reads '$v', not '$ID'; do not reboot blindly"
+		exit 1
+	fi
+	say "ARMED: the next boot runs '$ID' (read back from efivarfs)"
+	printf '\n'
+	say 'the menu will come up with "Power Off The System" preselected and the machine'
+	say 'will switch off from the boot loader, with no kernel in that boot.'
+	say 'Do not touch the menu: a manual pick overrides the one-shot.'
+	say 'Undo it before shutting down with:  sudo s5-halt disarm'
+}
+
+disarm() {
+	local v
+
+	[ "$(id -u)" = 0 ] || { bad 'this writes an EFI variable: use sudo'; exit 1; }
+	v=$(oneshot_value) || { say 'nothing was armed'; return 0; }
+	if v=$(oneshot_file) && [ -n "$v" ]; then
+		chattr -i "$v" 2>/dev/null || true
+		rm -f "$v" || { bad "could not remove $v"; exit 1; }
+	fi
+	say 'disarmed: the next boot is the normal one'
+}
+
+case "${1:-status}" in
+status)		status ;;
+check)		check ;;
+arm)		arm ;;
+disarm)		disarm ;;
+-h|--help|help)	sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' ;;
+*)		printf 'usage: %s [status|check|arm|disarm]\n' "$(basename "$0")" >&2; exit 2 ;;
+esac

@@ -14,6 +14,10 @@ states that the implementation, its tooling and its evidence file live here. It 
 — running the reference policy on this machine instead would not change that, and neither would
 the module being packaged for a different distribution.
 
+On `systemd-boot` machines there is a second mechanism here, separate from the shield: the
+[firmware power-off path](#machines-with-systemd-boot-the-firmware-power-off-path) for the case the
+shield cannot settle, measured at 1.32 W. Start at [`bin/s5-halt`](bin/s5-halt).
+
 ## The problem
 
 Screen dark, machine silent, chassis warm near the GPU, battery flat by morning — an "S5" that
@@ -302,6 +306,59 @@ different window it may not be subtracted from the baseline under rule 1.
   was doing the work; its witness record has since been trimmed by the log cap, which is why
   `rows.tsv` exists and why the rows above are quoted from the ledger rather than from prose.
 
+## Machines with systemd-boot: the firmware power-off path
+
+The shield settles the dGPU's subtree and lets the normal poweroff cut the rail. When the subtree
+**cannot** settle — a held reference, a driver that keeps the device awake — that poweroff still
+costs ~19 W, and the clean way out is a boot in which **no kernel runs at all**: the firmware does
+its own S5 with the hardware as the boot loader left it. GRUB can do that with `halt`. This unit
+boots with systemd-boot, which has no `halt`, so the equivalent is to let **systemd-boot itself**
+power the machine off, using its built-in "Power Off The System" entry, armed as a one-shot:
+
+```bash
+bin/s5-halt check      # can this machine do it, and what is missing if not
+sudo bin/s5-halt arm   # the NEXT boot powers off from the boot loader
+sudo bin/s5-halt disarm
+```
+
+Measured on this unit with the dGPU **pinned awake on purpose** (the hard case, not the
+compositor-already-let-go one), charger out, 0.76 h windows:
+
+| row | result | verdict |
+|---|---|---|
+| `halt-path-rare-builtin-2` (2026-10-07) | **1.007 Wh / 0.7622 h ⇒ 1.32 W** | CLEAN — ledger `OK` |
+| `halt-path-rare-builtin-1.5` (2026-10-06, superseded) | 3.404 Wh / 0.7628 h ⇒ 4.46 W | ledger `FAIL` — `energy_full` moved 4.77 Wh inside the window, so the absolute figure is not trustworthy |
+
+For scale, the reference machine's `grub-halt` reads 1.05 W over 45 min: the two paths land in the
+same place, and the EFI route is not several times worse. The rows, their registers and what the first
+one cannot carry are in [`docs/EVIDENCE.md`](docs/EVIDENCE.md#the-firmware-power-off-path-systemd-boot).
+
+What it costs: **nothing to compile, sign or write to the ESP.** The whole mechanism is one EFI
+variable, which also means arming still works after the ESP is unmounted — the stage where a
+`/boot`-writing fallback fails. What it does not give you is a marker to read afterwards: this route
+runs no application and leaves no kernel log, so the evidence that it worked is that the machine
+switched off and stayed off, plus the watt measured from the next boot.
+
+**Automatic detection exists, is opt-in, and has not yet been exercised end to end.** The detector
+runs as the `ExecStop` of a unit ordered after the session manager (so the dGPU is free to settle) and
+before `shutdown.target` (so the journal still works): it waits up to 20 s for the dGPU to reach
+D3cold, and only if it does not, arms the one-shot and reboots through the boot loader. If the arming
+fails it does **not** divert — a normal poweroff is better than a reboot that boots.
+
+```bash
+sudo halt.sh install     # installs both tools and enables the unit
+sudo halt.sh remove
+sudo touch /var/lib/s5-shield/halt-divert-disabled   # brake: one shutdown, no diverting
+```
+
+Test it on purpose by forcing the dGPU awake first — `echo on | sudo tee
+/sys/bus/pci/devices/0000:01:00.0/power/control`, then `systemctl poweroff`. The machine should POST
+and switch off instead of staying warm, and `bin/s5-evidence` reads the window afterwards.
+
+**Until that test has run on this machine, treat the detector as unproven.** What is measured is the
+path itself (1.32 W), armed by hand; the decision is new code with its branches tested in isolation
+(dry run, brake, already-settled, divert) but never yet in a real shutdown.
+
 ## Limits
 
 * The wait is a budget, not a guarantee. A subtree that cannot settle — a held reference (`use=`) —
@@ -354,6 +411,9 @@ them. The witness unit had a fourth such bug: with `DefaultDependencies=no` and 
 | `bin/s5-shield-status` | module loaded? installed source this revision? self-check result, device states |
 | `bin/s5-battery` | one-line battery/AC snapshot for a before/after measurement |
 | `bin/s5-shield-dryrun`, `bin/s5-logictest` | the two self-checks `install.sh` refuses to skip (the second also compiles and runs the blocker logic) |
+| `bin/s5-halt` | the separate firmware power-off path for `systemd-boot` machines: arms the boot loader's own "Power Off The System" entry as a one-shot (`status` / `check` / `arm` / `disarm`). No ESP writes, nothing to sign |
+| `bin/s5-halt-divert` | the automatic decision, run by the unit below: wait for the dGPU to settle, and divert through the firmware only if it will not |
+| `halt.sh`, `systemd/s5-halt-divert.service` | opt-in installer and unit for that decision (ordered like the witness, so it runs after the compositor is gone) |
 
 Everything here is **GPL-2.0-only** (`LICENSE`); the module declares it with an SPDX tag.
 Nothing outside `/usr/src/s5-shield-1.5`, `/etc/modprobe.d`, `/etc/modules-load.d`,

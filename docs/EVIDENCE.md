@@ -88,6 +88,39 @@ patch on 2026-10-04 because *their* policy already waits up to 90 s before their
 a wait inside the module adds nothing **there**. Both statements hold at once — on a machine with no
 policy layer, the wait is the only thing that can settle the subtree.
 
+## The firmware power-off path (systemd-boot)
+
+Not the shield: the same machine, but the poweroff routed through the boot loader so that **no kernel
+runs in that boot**. It is the systemd-boot equivalent of GRUB's `halt` — the boot loader's own
+"Power Off The System" entry, armed as a one-shot — and `bin/s5-halt` is what arms it (see the
+README). Two windows, deliberately the same length and the same arm-time state: the dGPU **pinned
+awake** with `power/control=on` (the hard case, not the compositor-already-let-go one), charger out at
+both ends, the shutdown/boot witness as the instrument.
+
+| date | label | result | verdict |
+|---|---|---|---|
+| 10-06 | `halt-path-rare-builtin-1.5` | 3.404 Wh / 0.7628 h ⇒ **4.46 W** | ledger `FAIL` — **superseded**: `energy_full` moved 4.77 Wh *inside* the window (80.747 → 75.976 Wh), which no other window here has done, and the gauge's own percentages (53% → 51%) say about half the absolute figure |
+| 10-07 | **`halt-path-rare-builtin-2`** | **1.007 Wh / 0.7622 h ⇒ 1.32 W** | **CLEAN** — ledger `OK`, boot check `FORWARD`, the `check-failed` marker cleared on that boot |
+
+Three things about the second window, because they are what make it the row and not the first one:
+
+* it is comparable, under rule 1, to the reference machine's `grub-halt` (1.05 W over 45 min) and to
+  the first pass (the same 0.76 h): on this firmware the EFI `ResetSystem(EfiResetShutdown)` path
+  lands in the same place as GRUB's ACPI `halt`, not several times above it;
+* **no kernel ran inside it** — the journal's boot list has the boot that shut down ending at
+  12:12:01 and the next one starting at 12:57:28, and the witness log holds exactly one shutdown
+  record and one boot record for the window;
+* it ran across a kernel crossing (`7.2.8-arch1-2` → `7.2.9-arch1-1`); the DKMS package rebuilt the
+  module for the new kernel (`srcversion` unchanged), and the row carries the new one.
+
+It is the hard case: `power/control=on` forbids runtime suspend, and the witness says so — `dGPU=D0
+port=D0 audio=D0` at entry, still `D0` after 6000 ms (*it does not suspend on its own*). That is the
+same arm-time state that measured **18.51 W** through a *normal* poweroff with `wait_ms=0`. With the
+exit path moved to the boot loader, the same state ends at 1.32 W.
+
+Raw registers and the full appendix are in the fork's `docs/EVIDENCE-second-unit.md` (merged upstream
+as `88d2e2d`) and, untrimmed, in `/var/lib/s5-shield/rows.tsv`.
+
 ## Diagnostics (not rows)
 
 Windows below the 0.5 h gate are not rows and are never quoted as if they were, but three of them
