@@ -5,10 +5,12 @@
 #
 # Removes everything the installer put on the machine: the loaded module, every
 # DKMS registration and its built module, the two config files, the source trees,
-# the optional shutdown witness, and the opt-in firmware power-off path (the
-# divert unit plus the two tools in /usr/local/bin). It touches nothing else - no
-# boot image, no boot entry, no kernel, no firmware setting. After this the machine
-# behaves exactly as it did before the installer ran.
+# the optional shutdown witness, and the opt-in firmware power-off path (the divert
+# unit, the two tools in /usr/local/bin, an armed one-shot, and - the one exception
+# to "no boot path" - the optional EFI application and its entry, which this project
+# added in the first place). It touches nothing else: no boot image, no kernel, no
+# other boot entry, no firmware setting. After this the machine behaves exactly as it
+# did before the installer ran.
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +46,20 @@ echo "=== 2b. firmware power-off path (only if it is installed) ==="
 if [ -f /etc/systemd/system/s5-halt-divert.service ] || [ -f /usr/local/bin/s5-halt-divert ]; then
 	"$SRC_DIR/halt.sh" remove
 else
-	echo "not installed"
+	echo "automatic divert: not installed"
+fi
+# An armed one-shot left behind would make the next boot power off instead of booting.
+if [ -e /sys/firmware/efi/efivars/LoaderEntryOneShot-* ]; then
+	"$SRC_DIR/bin/s5-halt" disarm || echo "could not disarm: check /sys/firmware/efi/efivars/LoaderEntryOneShot-*"
+else
+	echo "one-shot: nothing armed"
+fi
+# The optional application route adds an entry and an application to the ESP; it is
+# the one thing this project ever writes to a boot path, so it is taken back out.
+if [ -e /boot/EFI/s5-halt/s5-halt.efi ] || [ -e /boot/loader/entries/s5-halt.conf ]; then
+	"$SRC_DIR/bin/s5-halt-efi" remove
+else
+	echo "application route: not installed"
 fi
 
 echo

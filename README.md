@@ -339,6 +339,17 @@ variable, which also means arming still works after the ESP is unmounted — the
 runs no application and leaves no kernel log, so the evidence that it worked is that the machine
 switched off and stayed off, plus the watt measured from the next boot.
 
+**The optional second route keeps a marker.** [`efi/s5-halt.c`](efi/s5-halt.c) is a three-instruction
+EFI application that does the same poweroff from the boot loader and writes `S5HaltLastRun` before it
+goes, so "the firmware really did it" can be read back instead of remembered. It costs a build and, with
+Secure Boot on, a signature — `bin/s5-halt-efi install` does both and refuses to go on if it cannot sign
+it. The mechanism, both routes and what is tested are in
+[`docs/systemd-boot-halt.md`](docs/systemd-boot-halt.md).
+
+**The other solution in this story is packaged here too.** Upstream's module ships as an akmod, which
+means Fedora in practice; [`reference/`](reference/README.md) carries the same source packaged for DKMS
+for everywhere else, with the two packaging bugs that had to be found to make it work.
+
 **Automatic detection exists, is opt-in, and has not yet been exercised end to end.** The detector
 runs as the `ExecStop` of a unit ordered after the session manager (so the dGPU is free to settle) and
 before `shutdown.target` (so the journal still works): it waits up to 20 s for the dGPU to reach
@@ -413,11 +424,18 @@ them. The witness unit had a fourth such bug: with `DefaultDependencies=no` and 
 | `bin/s5-shield-dryrun`, `bin/s5-logictest` | the two self-checks `install.sh` refuses to skip (the second also compiles and runs the blocker logic) |
 | `bin/s5-halt` | the separate firmware power-off path for `systemd-boot` machines: arms the boot loader's own "Power Off The System" entry as a one-shot (`status` / `check` / `arm` / `disarm`). No ESP writes, nothing to sign |
 | `bin/s5-halt-divert` | the automatic decision, run by the unit below: wait for the dGPU to settle, and divert through the firmware only if it will not |
+| `bin/s5-halt-efi`, `efi/` | the optional application route: builds, signs and installs our own EFI poweroff (`efi/s5-halt.c`, two build routes) and reads back the marker it leaves |
+| `docs/systemd-boot-halt.md` | the mechanism, both routes, the anti-loop, Secure Boot and what is not tested |
+| `reference/` | the other solution (upstream's `s5_pmrt_arm` + policy), staged and packaged for DKMS, with the packaging bugs and the module-location rules written down |
 | `halt.sh`, `systemd/s5-halt-divert.service` | opt-in installer and unit for that decision (ordered like the witness, so it runs after the compositor is gone) |
 
 Everything here is **GPL-2.0-only** (`LICENSE`); the module declares it with an SPDX tag.
 Nothing outside `/usr/src/s5-shield-1.5`, `/etc/modprobe.d`, `/etc/modules-load.d`,
-`/lib/modules/<kver>/updates/dkms` and the optional witness unit is touched.
+`/lib/modules/<kver>/updates/dkms` and the optional witness unit is touched. The firmware
+power-off path adds nothing unless you ask for it: arming is one EFI variable, and only
+`bin/s5-halt-efi install` (the optional application route) writes to the ESP — one entry and one
+application, both of which `uninstall.sh` takes back out. `reference/install-dkms.sh` stages
+upstream's module under `/usr/src` and nothing else.
 
 ## Credits
 

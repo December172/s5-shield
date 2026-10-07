@@ -16,3 +16,7 @@ Module.symvers
 *~
 *.swp
 .DS_Store
+
+# EFI application build artifacts (efi/)
+*.efi
+*.so

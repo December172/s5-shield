@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# s5-halt-efi: the OPTIONAL firmware poweroff, with our own EFI application instead
+# of the boot loader's built-in entry.
+#
+# WHICH ROUTE TO USE. `bin/s5-halt` arms systemd-boot's own "Power Off The System"
+# entry: nothing to build, nothing to sign, nothing written to the ESP, and it is
+# what the measured rows used (1.32 W over 0.76 h). This tool is the other way: a
+# three-instruction EFI application of ours, which costs a build and, with Secure
+# Boot on, a signature - and buys one thing the built-in entry cannot give: it
+# writes a marker before switching off, so "the firmware really powered it off"
+# can be read afterwards instead of remembered. Use it when you want that proof, or
+# when the built-in entry is not offered by the loader.
+#
+# Usage:
+#   s5-halt-efi              same as `status`
+#   s5-halt-efi status       what is installed, armed, and what the last run left
+#   s5-halt-efi install      build, sign (if needed) and install app + entry on the ESP
+#   s5-halt-efi arm          arm the one-shot: the NEXT boot powers off from the firmware
+#   s5-halt-efi disarm       remove the arming, before the next boot
+#   s5-halt-efi remove       take the application, its entry and the marker back out
+#
+# FAIL SAFE, ALWAYS: whatever is missing is named and the command is not carried
+# out. In every failure case the poweroff continues along its normal path and only
+# the saving is lost.
+#
+# IT TOUCHES NO BOOT THAT ALREADY EXISTS: it adds one entry and one EFI variable.
+# It does not change the boot loader, the kernel or any previous entry. `disarm`
+# and the repository's uninstall.sh leave it as it was.
+set -u
+
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+EFIVARS=${S5_EFIVARS:-/sys/firmware/efi/efivars}
+ID=s5-halt
+BOOTCTL=$(command -v bootctl 2>/dev/null || true)
+ESP=
+APPLICATION=
+ENTRY=
+ONESHOT=NO
+SECUREBOOT=no
+LIMIT=''
+
+# The marker the application leaves when it runs (see efi/s5-halt.c). In efivarfs
+# the name carries its own GUID, and the first 4 bytes of the file are the
+# variable's attributes, not its content.
+MARK_NAME=S5HaltLastRun
+MARK_GUID=8b8c1b5e-2f1a-4b3c-9a7d-512c6e0a3f11
+mark_path() { printf '%s/%s-%s' "$EFIVARS" "$MARK_NAME" "$MARK_GUID"; }
+mark_value() {
+	local v; v=$(mark_path)
+	[ -e "$v" ] || return 1
+	tail -c +5 <"$v" 2>/dev/null | tr -d '\0'
+}
+
+# EFI variables are immutable (----i----); the attribute has to go before the file
+# can be removed, which is what bootctl does internally.
+delete_var() {
+	[ -e "$1" ] || return 0
+	chattr -i "$1" 2>/dev/null || true
+	rm -f "$1" 2>/dev/null || true
+}
+
+oneshot_file() { ls -1 "$EFIVARS"/LoaderEntryOneShot-* 2>/dev/null | head -1; }
+oneshot_value() {
+	local v; v=$(oneshot_file) || return 1
+	[ -n "$v" ] || return 1
+	tail -c +5 <"$v" 2>/dev/null | tr -d '\0'
+}
+
+# What this machine offers, read once. `esp_now` is the distinction that matters:
+# the path can be configured while the filesystem is not mounted, which is the state
+# during a poweroff - and arming does not need it, because it is a variable write.
+detect() {
+	local esp sb
+	if [ -n "$BOOTCTL" ]; then
+		esp=$("$BOOTCTL" --print-esp-path 2>/dev/null || true)
+		[ -n "$esp" ] && [ -d "$esp/loader/entries" ] && [ -d "$esp/EFI" ] && {
+			ESP="$esp"
+			APPLICATION="$esp/EFI/s5-halt/s5-halt.efi"
+			ENTRY="$esp/loader/entries/$ID.conf"
+			"$BOOTCTL" status 2>/dev/null | grep -q 'One-shot entry control' && ONESHOT=yes
+			sb=$("$BOOTCTL" status 2>/dev/null | grep -c 'Secure Boot: enabled' || true)
+			[ "${sb:-0}" -ge 1 ] && SECUREBOOT=yes
+		}
+	fi
+	[ -d "$EFIVARS" ] || LIMIT="no efivarfs: nothing can be armed here"
+}
+esp_now() { [ -n "$ESP" ] && [ -d "$ESP/EFI" ]; }
+require_root() {
+	[ "$(id -u)" = 0 ] || { echo "error: this writes to the ESP and to efivarfs; use sudo" >&2; exit 1; }
+}
+
+status() {
+	printf 'ESP            : %s\n' "${ESP:-(not found)}"
+	printf 'bootctl        : %s\n' "${BOOTCTL:-(not found)}"
+	printf 'one-shot entry : %s\n' "$ONESHOT"
+	printf 'Secure Boot    : %s\n' "$SECUREBOOT"
+	printf 'application    : %s%s\n' "${APPLICATION:-(no ESP)}" \
+		"$([ -n "$APPLICATION" ] && [ -e "$APPLICATION" ] && echo '  (installed)' || echo '  (missing: s5-halt-efi install)')"
+	printf 'entry          : %s%s\n' "${ENTRY:-(no ESP)}" \
+		"$([ -n "$ENTRY" ] && [ -e "$ENTRY" ] && echo '  (written)' || echo '  (missing: s5-halt-efi install)')"
+
+	# Arming is read from the variable, not from a state file of ours: the only
+	# truth is what systemd-boot will read when it boots.
+	local v
+	v=$(oneshot_value) && printf 'armed          : YES (%s)\n' "$v" || printf 'armed          : no\n'
+	[ -n "$LIMIT" ] && printf 'limit          : %s\n' "$LIMIT"
+
+	# The proof that the application RAN. There is no other: that boot leaves no
+	# kernel log at all. The firmware's time is UTC (this machine's RTC runs in UTC),
+	# so it is translated here: reading 05:50 for a 13:50 poweroff is exactly the
+	# confusion this avoids.
+	if mark=$(mark_value); then
+		case "$mark" in
+		*Z) mark_utc=$mark ;;
+		*)  mark_utc="${mark}Z" ;;	# an older marker had no Z, but was UTC too
+		esac
+		mark_local=$(date -d "$mark_utc" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || true)
+		if [ -n "$mark_local" ]; then
+			printf 'last poweroff  : YES, by firmware, on %s (%s)\n' "$mark_local" "$mark"
+		else
+			printf 'last poweroff  : YES, by firmware, on %s\n' "$mark"
+		fi
+	else
+		printf 'last poweroff  : there is no record that the application has ever run\n'
+	fi
+}
+
+install_efi() {
+	require_root
+	if [ -z "$APPLICATION" ]; then
+		echo "cannot install: no ESP or no bootctl (${LIMIT:-not found})" >&2
+		return 1
+	fi
+
+	echo "== 1. build =="
+	# `check` says which route this machine has and why not the other. Choosing from
+	# its output, instead of trying the missing one and falling back after a failure,
+	# avoids showing an objcopy error that is not an error.
+	if ! check_out=$(make -C "$HERE/efi" check 2>&1); then
+		printf '%s\n' "$check_out" >&2
+		return 1
+	fi
+	printf '%s\n' "$check_out"
+	route=clang
+	case "$check_out" in
+	*"gnu-efi + objcopy route (efi-app-x86_64): READY"*) route=gnu-efi ;;
+	esac
+	if [ "$route" = gnu-efi ]; then
+		if ! make -C "$HERE/efi"; then
+			echo "the gnu-efi route failed; trying clang + lld-link"
+			make -C "$HERE/efi" clang || return 1
+		fi
+	else
+		make -C "$HERE/efi" clang || return 1
+	fi
+	echo "built by route: $route"
+
+	echo
+	echo "== 2. sign (only if needed) =="
+	efi="$HERE/efi/s5-halt.efi"
+	if [ "$SECUREBOOT" = yes ]; then
+		# Signed by the user with THEIR keys: this repository installs no keys and
+		# touches no Secure Boot database.
+		if command -v sbctl >/dev/null 2>&1; then
+			sbctl sign -s "$efi" || { echo "sbctl sign failed" >&2; return 1; }
+		elif command -v sbsign >/dev/null 2>&1; then
+			echo "sbsign is here, but your keys are needed:" >&2
+			echo "  sbsign --key /path/db.key --cert /path/db.crt --output <efi> <efi>" >&2
+			echo "then run 's5-halt-efi install' again." >&2
+			return 1
+		else
+			echo "Secure Boot is on and there is neither sbctl nor sbsign: sign it by hand" >&2
+			return 1
+		fi
+	else
+		echo "Secure Boot disabled: no signature needed"
+	fi
+	command -v sbctl >/dev/null 2>&1 && { sbctl verify "$efi" 2>/dev/null | sed 's/^/  /' || true; }
+
+	echo
+	echo "== 3. install to the ESP (nothing that exists is touched) =="
+	install -d -m755 "$(dirname "$APPLICATION")" || return 1
+	install -m644 "$efi" "$APPLICATION" || return 1
+
+	# The entry is written ONCE and stays: arming a poweroff is then only an EFI
+	# variable write, with no need to mount /boot or write to the ESP during the
+	# poweroff window.
+	cat >"$ENTRY" <<'EOF'
+# s5-halt-efi: one-shot entry, armed by `s5-halt-efi arm` and consumed by
+# systemd-boot. It is NOT deleted when used: without the LoaderEntryOneShot
+# variable it is just another menu entry, and the real barrier against a loop is
+# that the application deletes that variable before powering off.
+title   S5 - power off from the firmware (the dGPU did not fall asleep)
+efi     /EFI/s5-halt/s5-halt.efi
+EOF
+	chmod 0644 "$ENTRY" 2>/dev/null || true
+	sync
+	echo
+	echo "installed: $APPLICATION + $ENTRY (Secure Boot=$SECUREBOOT)"
+	echo "now: s5-halt-efi arm   (and power off to use it)"
+}
+
+arm() {
+	require_root
+	[ -d "$EFIVARS" ] || { echo "no $EFIVARS: nothing to arm" >&2; return 1; }
+	[ -n "$BOOTCTL" ] || { echo "no bootctl: nothing to arm" >&2; return 1; }
+	# The entry and application are checked only if the ESP is readable now. If it is
+	# not, arming is still valid - that is the whole point of this route - and it is
+	# said out loud instead of refusing.
+	if esp_now; then
+		[ -e "$APPLICATION" ] && [ -e "$ENTRY" ] || {
+			echo "the application or the entry is missing: run 's5-halt-efi install' first" >&2
+			return 1
+		}
+	else
+		echo "note: the ESP is not mounted, so I cannot re-check the entry and the"
+		echo "      application. Arming does not need them: it is an EFI variable."
+	fi
+
+	# The marker from the previous run goes first, so what is read afterwards
+	# belongs to this one.
+	delete_var "$(mark_path)"
+
+	if ! "$BOOTCTL" set-oneshot "$ID" >/dev/null 2>&1; then
+		echo "'$BOOTCTL set-oneshot $ID' failed; nothing was armed" >&2
+		return 1
+	fi
+	v=$(oneshot_value) || { echo "the variable is not there after arming; do not reboot blindly" >&2; return 1; }
+	[ "$v" = "$ID" ] || { echo "the variable reads '$v', not '$ID'; do not reboot blindly" >&2; return 1; }
+	echo "ARMED: the next boot runs '$ID' (read back from efivarfs)"
+	echo "the menu preselection is this entry; do not touch it, and do not be surprised"
+	echo "by the POST: the firmware powers the machine off with no kernel in that boot."
+}
+
+disarm() {
+	require_root
+	v=$(oneshot_file) || { echo "nothing was armed"; return 0; }
+	delete_var "$v"
+	[ -e "$v" ] && { echo "could not delete $v (try: sudo chattr -i $v && sudo rm -f $v)" >&2; return 1; }
+	sync
+	echo "disarmed"
+}
+
+# The way back out: the application, its entry, the arming and the marker. This is
+# what uninstall.sh calls when the optional route was installed, and it lives here
+# because only this tool knows those paths.
+remove_efi() {
+	require_root
+	disarm >/dev/null 2>&1 || true
+	[ -n "$ENTRY" ] && [ -e "$ENTRY" ] && rm -f "$ENTRY" && echo "removed $ENTRY"
+	[ -n "$APPLICATION" ] && [ -e "$APPLICATION" ] && rm -f "$APPLICATION" && echo "removed $APPLICATION"
+	if [ -n "$APPLICATION" ]; then
+		rmdir "$(dirname "$APPLICATION")" 2>/dev/null && echo "removed the now-empty EFI/s5-halt directory"
+	fi
+	delete_var "$(mark_path)"
+	sync
+	echo "the firmware poweroff application route is no longer installed"
+}
+
+detect
+case "${1:-status}" in
+status)		status ;;
+install)	install_efi ;;
+arm)		arm ;;
+disarm)		disarm ;;
+remove)		remove_efi ;;
+*)		printf 'usage: %s [status|install|arm|disarm|remove]\n' "$(basename "$0")" >&2; exit 2 ;;
+esac
